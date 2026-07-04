@@ -1,0 +1,717 @@
+# Tor-VPN Manager — v3.4.0
+
+![Python](https://img.shields.io/badge/Python-3.8+-blue?logo=python)
+![Platform](https://img.shields.io/badge/Platform-Ubuntu%20%7C%20Debian-orange?logo=linux)
+![License](https://img.shields.io/badge/License-MIT-green)
+![Version](https://img.shields.io/badge/Version-3.4.0-blue)
+![Systemd](https://img.shields.io/badge/Systemd-service-lightgrey?logo=linux)
+
+> [Documentation en français](README.fr.md)
+
+Route **all your network traffic through OpenVPN tunneled inside Tor** on Ubuntu/Debian. A systemd daemon runs in the background and automatically manages Tor, OpenVPN, IPv6 blocking, LAN sharing, and connectivity monitoring — with a full GUI and CLI.
+
+---
+
+## Table of Contents
+
+1. [Architecture](#architecture)
+2. [Requirements](#requirements)
+3. [Installation](#installation)
+4. [Project Structure](#project-structure)
+5. [Graphical Interface](#graphical-interface)
+6. [CLI `tor-vpn`](#cli-tor-vpn)
+7. [Daemon Internals](#daemon-internals)
+8. [iptables Chains](#iptables-chains)
+9. [Failover & Watchdog](#failover--watchdog)
+10. [LAN Sharing](#lan-sharing)
+11. [Split DNS — Local Domains](#split-dns--local-domains)
+12. [Tor Configuration (torrc)](#tor-configuration-torrc)
+13. [Automatic Network Repair](#automatic-network-repair)
+14. [config.json Format](#configjson-format)
+15. [Security](#security)
+16. [Getting Started](#getting-started)
+17. [Uninstallation](#uninstallation)
+
+---
+
+## Architecture
+
+```
+User
+    │
+    ├── tor-vpn gui          ──►  GUI (main.py → gui/app.py)
+    │                              • Reads/writes config.json and torrc
+    │                              • Calls systemctl via pkexec
+    │                              • Never touches network processes
+    │
+    ├── tor-vpn <command>    ──►  CLI wrapper (/usr/local/bin/tor-vpn)
+    │                              • Calls systemctl
+    │
+    └── systemd              ──►  tor-vpn-manager.service
+                                   │
+                                   └── daemon/  (root)
+                                         │
+                                         ├── Tor  (subprocess, port 9050/9051)
+                                         │         └── optional torrc
+                                         │
+                                         ├── OpenVPN ──► SOCKS5 127.0.0.1:9050 ──► Tor ──► Internet
+                                         │              (tunX, redirect-gateway)
+                                         │
+                                         ├── iptables  (IPv6 block, LAN sharing)
+                                         │
+                                         └── Watchdog  (connectivity + throughput)
+
+
+Full network flow:
+  App → tunX → OpenVPN → SOCKS5:9050 → Tor → Tor relays → VPN server → Internet
+```
+
+The GUI and the daemon are **fully decoupled**: the GUI only writes config files and calls systemd. It never monitors processes and cannot interfere with an active connection.
+
+---
+
+## Requirements
+
+| Component | Min version | Role |
+|-----------|-------------|------|
+| Ubuntu / Debian | 20.04 / 11 | Base system |
+| Python | 3.8+ | Daemon + GUI |
+| python3-tk | — | GUI toolkit |
+| tor | — | SOCKS5 proxy and Tor network |
+| openvpn | 2.4+ | Encrypted tunnel to VPN provider |
+| dnsmasq | — | DHCP server for LAN sharing |
+| curl / dnsutils | — | Connectivity and DNS tests |
+| systemd + systemd-resolved | — | Service management and DNS |
+
+---
+
+## Installation
+
+```bash
+sudo bash install.sh
+```
+
+The installer runs **6 steps**:
+
+**1. Dependencies**
+```bash
+apt install tor openvpn python3 python3-tk dnsutils dnsmasq curl
+```
+
+**2. Configuration directory**
+- Creates `/etc/tor-vpn-manager/` with `700` permissions (root only)
+- Writes `/etc/tor-vpn-manager/install_dir` (path used by the CLI)
+- Auto-migrates any existing config from `/root/.config/tor-vpn-manager/` or `/opt/tor-vpn-manager/`
+
+**3. System services**
+- Enables and starts `systemd-resolved`
+- **Disables and stops** the system `tor` service — the daemon manages Tor directly as a subprocess for precise control over startup, logs, and restarts
+
+**4. Systemd service**
+Creates `/etc/systemd/system/tor-vpn-manager.service`:
+- `ExecStartPre`: iptables cleanup script (removes orphan rules from the previous session)
+- `ExecStart`: `python3 -m daemon` from the install directory
+- `ExecStopPost`: same cleanup script
+- `Restart=on-failure` with a 15s delay, max 5 attempts in 5 minutes
+- `KillMode=control-group`: systemd kills the entire cgroup (Tor, OpenVPN, dnsmasq included)
+- `TimeoutStopSec=30`
+
+**5. Sleep/wake hook**
+Installs `/lib/systemd/system-sleep/tor-vpn-sleep`: automatically restarts the daemon 3 seconds after each wake from sleep or hibernation. Without this hook, Tor circuits are stale after wake but port 9050 is still open, causing OpenVPN to reconnect without going through Tor.
+
+**6. CLI and GUI launcher**
+- Installs `/usr/local/bin/tor-vpn` (copy of `tor-vpn-cli.sh`)
+- Creates `/etc/xdg/autostart/tor-vpn-gui.desktop` (appears in app menus)
+
+---
+
+## Project Structure
+
+```
+tor-vpn-manager/
+├── main.py              GUI entry point — checks root rights, launches ConfigApp
+├── constants.py         Shared constants for GUI + daemon (paths, palette, defaults)
+├── install.sh           Ubuntu/Debian installation script
+├── repair_network.sh    Network repair script (iptables, routes, DNS cleanup)
+├── tor-vpn-cli.sh       CLI source — copied to /usr/local/bin/tor-vpn by install.sh
+├── template.ovpn        Annotated template to create a compatible .ovpn file
+│
+├── daemon/              Daemon package (launched by systemd via python3 -m daemon)
+│   ├── __init__.py      Daemon class (aggregates all mixins) + main()
+│   ├── __main__.py      python3 -m daemon entry point
+│   ├── core.py          DaemonCore — shared state, config, logging, signals, orchestration
+│   ├── tor.py           TorMixin — Tor start/stop, optional torrc, NEWNYM
+│   ├── network.py       NetworkMixin — gateway, SOCKS, Tor /32 route protection
+│   ├── firewall.py      FirewallMixin — iptables/ip6tables, IPv6 block, LAN sharing, dnsmasq
+│   ├── dns.py           DNSMixin — split DNS via systemd-resolved drop-in
+│   ├── openvpn.py       OpenVPNMixin — OpenVPN loop, provider failover
+│   └── watchdog.py      WatchdogMixin — connectivity/throughput monitoring, full restart
+│
+├── gui/                 GUI package
+│   ├── __init__.py
+│   └── app.py           ConfigApp — full tkinter interface (6 tabs)
+│
+└── providers/           .ovpn files per provider (not versioned)
+    └── <ProviderName>/
+        └── <file>.ovpn
+```
+
+**Files generated at install / runtime:**
+```
+/etc/tor-vpn-manager/
+├── config.json               Main config (mode 600, root:root)
+├── torrc                     Custom Tor config (mode 600, optional)
+├── install_dir               Install path (read by CLI)
+├── auth.tmp                  Temporary OpenVPN credentials (created/deleted each session)
+├── tor-vpn-routes.txt        Active Tor /32 routes (persisted across restarts)
+└── tor_data/                 Tor persistent data (descriptors, keys, cache)
+
+/etc/systemd/system/tor-vpn-manager.service
+/etc/systemd/resolved.conf.d/tor-vpn-split.conf   (if split DNS is enabled)
+/lib/systemd/system-sleep/tor-vpn-sleep
+/usr/local/bin/tor-vpn
+/usr/local/lib/tor-vpn-cleanup.sh
+/etc/xdg/autostart/tor-vpn-gui.desktop
+```
+
+---
+
+## Graphical Interface
+
+### Launch
+
+```bash
+tor-vpn gui          # Recommended — pkexec prompts for root password
+sudo python3 main.py # Direct launch
+```
+
+### Providers Tab
+
+Manages VPN providers and their accounts. List order defines connection and failover priority.
+
+**Provider:**
+- Free name (e.g. ProtonVPN, Mullvad)
+- Associated `.ovpn` file — copied to `providers/<Name>/` on selection
+- ↑ ↓ buttons to reorder priority
+
+**Accounts per provider:**
+- Each provider can have multiple accounts (username + password)
+- Stored as base64 in `config.json` (simple obfuscation, see [Security](#security))
+- ↑ ↓ buttons to reorder; the daemon tries accounts in order
+
+**Automatic failover:** if one account fails, the daemon moves to the next account of the same provider, then to the next provider.
+
+**Import / Export `.tvpn`:** ZIP archive containing `config.json` + all `.ovpn` files. Transfers the complete configuration between machines.
+
+### Exclusions Tab
+
+#### Split DNS — Local domains
+
+Routes DNS queries for specific domains to your local DNS server, while everything else goes through the VPN's DNS.
+
+| Field | Description |
+|-------|-------------|
+| **Local DNS server** | IP of your DNS server (e.g. `10.0.50.253`) |
+| **Domains** | Domains to route to this DNS (e.g. `.local`, `.home`) |
+
+> **Important:** the network containing your DNS server must appear in the **Excluded IPs/Networks** below.
+
+#### IPs / Networks excluded from tunnel
+
+CIDRs and IPs that bypass the tunnel and go through the local gateway. The daemon injects `--route <ip> <mask> net_gateway` into the OpenVPN command.
+
+**Typical use cases:**
+- Local network (`192.168.1.0/24`)
+- DNS server subnet — **required if split DNS is enabled**
+- NAS, network printers, local servers
+
+### Settings Tab
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| **Block IPv6** | disabled | DROP ip6tables on OUTPUT + FORWARD |
+| **Auto-reconnect** | enabled | Automatically restarts the tunnel |
+| **Min VPN speed (KB/s)** | 100 | Below N times in a row → failover. 0 = disabled |
+| **Min Tor speed (KB/s)** | 50 | Below N times in a row → new circuit. 0 = disabled |
+| **Consecutive measurements** | 3 | Measurements below threshold before action |
+| **Autostart** | disabled | `systemctl enable/disable tor-vpn-manager` |
+
+**"Repair Network" button:** runs `repair_network.sh` manually — stops the service, clears all iptables rules, routes and DNS blocks, then prompts to restart. Useful when the connection is completely stuck despite a service restart.
+
+### LAN Sharing Tab
+
+Shares the Tor+VPN tunnel with devices on a second network interface.
+
+| Setting | Description |
+|---------|-------------|
+| **Interface** | Network card to use (auto-filters lo, tun*, docker*, etc.) |
+| **Card IP** | Gateway IP assigned to this interface (e.g. `10.0.0.1`) |
+| **CIDR subnet** | DHCP range (e.g. `10.0.0.0/24`) |
+| **DHCP server** | Automatically starts dnsmasq |
+| **Enable at start** | Starts sharing as soon as the tunnel is active |
+
+### Tor (torrc) Tab
+
+Customizes Tor configuration via a dedicated `torrc` file. If no torrc is defined, Tor starts with the minimal parameters built into the daemon.
+
+**3 preset profiles:**
+
+| Profile | Use case |
+|---------|----------|
+| **Stable VPN** | Long circuits, active keepalive — recommended for daily use |
+| **Enhanced anonymity** | Traffic padding, Five Eyes exclusion, slow rotation |
+| **Performance** | Short circuits, aggressive timeout, fast rotation |
+
+**Configurable options:**
+
+| Option | Description |
+|--------|-------------|
+| `LongLivedPorts 1194,443` | Prefers stable relays for OpenVPN ports |
+| `LearnCircuitBuildTimeout 0` | Fixed circuit timeout (more predictable) |
+| `MaxCircuitDirtiness` | Max circuit lifetime before renewal (s) |
+| `CircuitBuildTimeout` | Max circuit build time (s) |
+| `NewCircuitPeriod` | How often new circuits are built (s) |
+| `KeepalivePeriod` | Keepalive cells to maintain circuits across NAT |
+| `NumEntryGuards` | Number of entry guard nodes |
+| `GuardLifetime` | How long to keep guards |
+| `AvoidDiskWrites 1` | Reduces disk writes |
+| `SafeLogging 1` | Masks IPs in Tor logs |
+| `ClientUseIPv6 0` | Disables IPv6 for Tor |
+| `TestSocks 1` | Warns on local DNS leak via SOCKS |
+| `ConnectionPadding 1` | Traffic analysis resistance (↑ bandwidth) |
+| `ExcludeExitNodes` | Exclude exit nodes by country (e.g. `{us},{gb}`) |
+| `StrictNodes` | Strict exclusions (may disconnect if no node available) |
+
+**Expert mode:** editable text area showing the full torrc. Updates in real time as options change. Can be edited directly for advanced parameters.
+
+**Apply button** → writes `/etc/tor-vpn-manager/torrc` + restarts the service.  
+**Reset button** → deletes the torrc + restarts with the daemon's minimal config.
+
+> Mandatory parameters (`SocksPort`, `ControlPort`, `CookieAuthentication`, `DataDirectory`) are always enforced at apply time.
+
+---
+
+## CLI `tor-vpn`
+
+```bash
+# Service control (requires root)
+sudo tor-vpn start       # Start the daemon
+sudo tor-vpn stop        # Stop the daemon
+sudo tor-vpn restart     # Restart the daemon
+sudo tor-vpn enable      # Enable autostart at boot
+sudo tor-vpn disable     # Disable autostart
+
+# Graphical interface
+tor-vpn gui
+
+# Monitoring
+tor-vpn status           # Full state: service, Tor, VPN, split DNS, public IP
+tor-vpn logs [n]         # Last n lines of journal (default: 60)
+tor-vpn follow           # Live logs (Ctrl+C to exit)
+tor-vpn ip               # Current public IP
+```
+
+---
+
+## Daemon Internals
+
+### Full startup sequence
+
+```
+1.  Clean up orphan iptables rules (from previous session)
+2.  Start Tor as a subprocess (with torrc if present)
+3.  Wait for Tor 100% bootstrap (240s timeout)
+4.  Start the OpenVPN loop in a dedicated thread
+5.  Start the monitoring loop in the main thread
+```
+
+### Tor management
+
+Tor is launched directly as a subprocess (not via the system service).
+
+**Without custom torrc** (minimal built-in config):
+```
+--SocksPort 9050  --ControlPort 9051  --CookieAuthentication 0
+--DataDirectory /etc/tor-vpn-manager/tor_data  --Log notice stdout
+```
+
+**With custom torrc** (created via the GUI Tor tab):
+```
+tor --torrc-file /etc/tor-vpn-manager/torrc --Log notice stdout
+```
+`--Log notice stdout` is always appended on the command line so the daemon can detect the bootstrap regardless of torrc settings.
+
+If Tor crashes, it is automatically restarted (up to 5 times with a 15s delay).
+
+### OpenVPN management
+
+```
+openvpn
+  --config            <file.ovpn>
+  --auth-user-pass    /etc/tor-vpn-manager/auth.tmp
+  --script-security   2
+  --verb              3          ← required for net_addr_v4_add in logs
+  --ping              10
+  --ping-exit         60
+  --connect-timeout   60         ← extended because Tor circuits can be slow
+  --connect-retry     1
+  --connect-retry-max 1
+  --socks-proxy       127.0.0.1 9050
+  [--route <ip> <mask> net_gateway ...]
+```
+
+**Tor route protection:**
+As soon as OpenVPN assigns an IP to the tunnel (`net_addr_v4_add`, visible via `--verb 3`), the daemon **synchronously** adds static `/32` routes for all active Tor guard IPs via the original local gateway. This must happen *before* the `up` script installs `redirect-gateway` routes. Without this protection, Tor would try to reach its guards through the tunnel, creating a loop that kills the connection. Routes are persisted in `/etc/tor-vpn-manager/tor-vpn-routes.txt` and cleanly removed at shutdown.
+
+**Split DNS timing:**
+Split DNS is applied **after** `Initialization Sequence Completed`, not at daemon startup. This ensures it is not overwritten by OpenVPN's `update-resolv-conf` script which runs at connection time.
+
+**Connection sequence:**
+When `Initialization Sequence Completed` is detected:
+1. Split DNS applied (after OpenVPN's up script)
+2. IPv6 blocking enabled (if configured)
+3. LAN sharing started (if `lan_auto = true`)
+
+### Sleep/wake hook
+
+`/lib/systemd/system-sleep/tor-vpn-sleep` is called by the kernel on every sleep/wake event. On wake (`post`), it waits 3 seconds then runs `systemctl restart tor-vpn-manager`. This delay gives network interfaces time to reconnect before the daemon relaunches Tor.
+
+---
+
+## iptables Chains
+
+The daemon creates **dedicated named chains** for clean teardown without interfering with other rules.
+
+### IPv6 blocking — `TORVPN_KS6` / `TORVPN_KS6_FWD`
+
+```
+OUTPUT/FORWARD:
+RETURN  → lo
+RETURN  → tunX
+RETURN  → ESTABLISHED,RELATED
+DROP    → everything else (IPv6)
+```
+
+Protects against IPv6 leaks when the VPN provider does not support it.
+
+### LAN sharing — `TORVPN_LAN_FWD` (FORWARD)
+
+```
+RETURN  → ESTABLISHED,RELATED
+RETURN  → <lan_iface> → tunX
+DROP    → <lan_iface> → everything else
+
+NAT POSTROUTING: MASQUERADE source=<lan_subnet> out=tunX
+```
+
+---
+
+## Failover & Watchdog
+
+### Failure detection
+
+The watchdog checks connectivity every **9 seconds** (after a **30-second grace period** post-connection):
+
+1. `ip link show tunX` — does the interface exist?
+2. TCP connection to `1.1.1.1:443` via `SO_BINDTODEVICE tunX` (5s timeout) — does the tunnel actually route traffic?
+
+If the check fails **2 times in a row** (~28s max): `_full_restart()` — full Tor + OpenVPN shutdown, orphan `/32` route cleanup, full restart.
+
+If connectivity returns after a restart, the counter resets.
+
+### Automatic emergency repair
+
+If **3 consecutive full restarts** all fail (`_full_restart_count`), the watchdog triggers `_emergency_repair()`:
+
+```
+1. Runs repair_network.sh --internal
+   → cleans iptables (IPv6 + LAN), blocked OpenVPN routes, systemd-resolved DNS
+   → does not touch the systemd service (the daemon stays in control)
+2. sys.exit(1)
+   → systemd detects the crash and automatically relaunches the daemon (Restart=on-failure)
+```
+
+**Typical log sequence during a total block:**
+```
+[WARN] Watchdog: no connectivity (1/2) …
+[WARN] Watchdog: no connectivity (2/2) …
+[ERROR] Watchdog: full restart (1/3) …
+[WARN] Watchdog: no connectivity (1/2) …
+[ERROR] Watchdog: full restart (2/3) …
+[WARN] Watchdog: no connectivity (1/2) …
+[ERROR] Watchdog: full restart (3/3) …
+[ERROR] 3 failed restarts — running repair_network.sh …
+[WARN]  Repair done — exiting for systemd relaunch.
+← systemd automatically relaunches the daemon
+```
+
+### Low throughput detection
+
+- **Low VPN throughput** N times in a row → failover to next account/provider
+- **Low Tor throughput** N times in a row → `SIGNAL NEWNYM`: Tor builds a new circuit
+
+### Failover logic
+
+```
+Provider 1, Account 1 → Provider 1, Account 2 → ... → Provider 2, Account 1 → ...
+All exhausted → back to start → give up after 5 attempts
+```
+
+### Clean shutdown (SIGTERM / SIGINT)
+
+```
+1. SIGTERM → OpenVPN
+2. SIGTERM → Tor
+3. Remove Tor /32 routes
+4. Teardown LAN sharing + stop dnsmasq
+5. Remove ip6tables chains
+6. Remove split DNS drop-in
+7. Remove auth.tmp
+```
+
+---
+
+## LAN Sharing
+
+When LAN sharing is enabled:
+
+1. Gateway IP assigned to the LAN interface (`ip addr add`)
+2. IP routing enabled (`sysctl net.ipv4.ip_forward=1`)
+3. NAT MASQUERADE so LAN traffic exits through the tunnel
+4. `TORVPN_LAN_FWD` chain: blocks all LAN traffic not heading to the tunnel
+5. dnsmasq in `--no-daemon` mode: DHCP in the subnet, DNS `1.1.1.1` through the tunnel
+
+If the tunnel drops, LAN traffic is blocked — no leak through the direct connection.
+
+---
+
+## Split DNS — Local Domains
+
+Lets you reach services on your local network with a custom domain name **while the VPN is active**.
+
+### Why it is needed
+
+Without split DNS, OpenVPN's `redirect-gateway def1` routes all traffic through the tunnel — including packets to your local DNS server, which becomes unreachable.
+
+With split DNS:
+- `.local` → your local DNS (`10.0.50.253`)
+- Everything else → VPN DNS through Tor
+
+### Configuration
+
+**In the GUI Exclusions tab:**
+
+1. Enter the local DNS server IP
+2. Add local domains (e.g. `.local`, `.home`)
+3. Add the DNS subnet to excluded IPs (e.g. `10.0.50.0/24`) — **critical step**
+4. Save + Restart
+
+The daemon automatically generates:
+
+```ini
+# /etc/systemd/resolved.conf.d/tor-vpn-split.conf
+[Resolve]
+DNS=10.0.50.253
+Domains=~local
+```
+
+### Verification
+
+```bash
+resolvectl status            # see routed domains
+dig server.local             # must resolve via 10.0.50.253
+tor-vpn status               # shows "Split DNS: active (→ 10.0.50.253)"
+```
+
+---
+
+## Tor Configuration (torrc)
+
+The **Tor (torrc)** tab generates and writes `/etc/tor-vpn-manager/torrc`. If this file exists, the daemon passes it to Tor via `--torrc-file`. If absent, Tor starts with the minimal built-in arguments.
+
+### Mandatory parameters (always present)
+
+```ini
+SocksPort 9050
+ControlPort 9051
+CookieAuthentication 0
+DataDirectory /etc/tor-vpn-manager/tor_data
+```
+
+### Stable VPN profile (recommended)
+
+```ini
+LongLivedPorts 1194,443
+LearnCircuitBuildTimeout 0
+MaxCircuitDirtiness 3600
+CircuitBuildTimeout 60
+NewCircuitPeriod 60
+KeepalivePeriod 60
+NumEntryGuards 3
+GuardLifetime 2 months
+AvoidDiskWrites 1
+SafeLogging 1
+ClientUseIPv6 0
+TestSocks 1
+```
+
+### Enhanced anonymity profile
+
+```ini
+# All of Stable VPN +
+ConnectionPadding 1
+NewCircuitPeriod 120
+ExcludeExitNodes {us},{gb},{ca},{au},{nz}
+StrictNodes 0
+```
+
+### Performance profile
+
+```ini
+LongLivedPorts 1194,443
+LearnCircuitBuildTimeout 0
+MaxCircuitDirtiness 600
+CircuitBuildTimeout 15
+NewCircuitPeriod 30
+KeepalivePeriod 30
+NumEntryGuards 2
+GuardLifetime 1 months
+AvoidDiskWrites 1
+```
+
+### Reset
+
+The **Reset** button deletes the torrc file. On the next service start, Tor runs with minimal parameters and no external config file.
+
+---
+
+## Automatic Network Repair
+
+`repair_network.sh` is the emergency recovery script. It can be triggered in **three ways**:
+
+| Trigger | Mode | Behavior |
+|---------|------|----------|
+| GUI "Repair Network" button | manual | Stops service, cleans everything, prompts to restart |
+| `sudo bash repair_network.sh` | manual CLI | Same as GUI button |
+| Watchdog (3 failed restarts) | automatic | `--internal`: cleans without `systemctl stop`, then `sys.exit(1)` for systemd relaunch |
+
+**What the script cleans:**
+
+1. Residual OpenVPN and Tor processes (`pkill`)
+2. ip6tables chains `TORVPN_KS6` (IPv6 blocking)
+3. iptables chains `TORVPN_LAN_FWD` (LAN sharing)
+4. systemd-resolved DNS — removes the drop-in and restarts `systemd-resolved`
+5. Blocked OpenVPN def1 routes (`0.0.0.0/1`, `128.0.0.0/1`, `default` on tun0)
+6. Final connectivity check (`ip route get 1.1.1.1`, `getent ahosts`)
+
+---
+
+## config.json Format
+
+`/etc/tor-vpn-manager/config.json` — mode `600`, root only.
+
+```json
+{
+  "providers": [
+    {
+      "name": "ProtonVPN",
+      "ovpn_file": "providers/ProtonVPN/server.ovpn",
+      "accounts": [
+        { "u": "dXNlcm5hbWU=", "p": "cGFzc3dvcmQ=" }
+      ]
+    }
+  ],
+  "auto_reconnect": true,
+  "block_ipv6": false,
+  "excluded_ips": ["192.168.1.0/24", "10.0.50.0/24"],
+  "excluded_domains": [".local"],
+  "local_dns": "10.0.50.253",
+  "tor_min_speed_kbs": 50,
+  "vpn_min_speed_kbs": 100,
+  "speed_fail_count": 3,
+  "lan_iface": "",
+  "lan_gateway": "10.0.0.1",
+  "lan_subnet": "10.0.0.0/24",
+  "lan_dhcp": true,
+  "lan_auto": false,
+  "autostart": false
+}
+```
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `providers[].ovpn_file` | string | Path relative to the install directory |
+| `providers[].accounts[].u` | string | Base64-encoded username |
+| `providers[].accounts[].p` | string | Base64-encoded password |
+| `excluded_ips` | list | CIDRs/IPs routed via local gateway |
+| `excluded_domains` | list | Domains routed to local DNS |
+| `local_dns` | string | Local DNS server IP |
+| `tor_min_speed_kbs` | int | Tor KB/s threshold before new circuit (0 = disabled) |
+| `vpn_min_speed_kbs` | int | VPN KB/s threshold before failover (0 = disabled) |
+| `speed_fail_count` | int | Consecutive below-threshold measurements before action |
+
+---
+
+## Security
+
+**VPN credentials:** stored as base64 in `config.json`. This is obfuscation, **not encryption**. The file is mode `600` — accessible by root only.
+
+**auth.tmp:** written as mode `600` just before launching OpenVPN, deleted in the `finally` block as soon as OpenVPN has read the file.
+
+**torrc:** written as mode `600` — root only.
+
+**Tor as proxy:** the VPN server sees a Tor exit node IP, never your real IP. Your ISP sees that you use Tor, but does not know you are using a VPN or what destination you are reaching.
+
+---
+
+## Getting Started
+
+```bash
+# 1. Install
+sudo bash install.sh
+
+# 2. Open the configuration interface
+tor-vpn gui
+
+# 3. Providers tab:
+#    a. "+ Add" → provider name
+#    b. "Choose / Change" → select your .ovpn file
+#    c. "+ Add account" → username + password
+
+# 4. (Optional) Tor (torrc) tab:
+#    - Select the "Stable VPN" profile
+#    - Click "Apply + Restart"
+
+# 5. (Optional) Exclusions tab:
+#    - Local DNS + domains + DNS subnet in excluded IPs
+
+# 6. Save
+
+# 7. Start
+sudo tor-vpn start
+
+# 8. Follow the startup
+tor-vpn follow
+# Wait for "VPN tunnel active." (Tor bootstrap = 1-3 minutes)
+
+# 9. Verify
+tor-vpn status
+```
+
+---
+
+## Uninstallation
+
+```bash
+sudo tor-vpn stop
+sudo systemctl disable tor-vpn-manager
+sudo rm /etc/systemd/system/tor-vpn-manager.service
+sudo rm /lib/systemd/system-sleep/tor-vpn-sleep
+sudo rm /usr/local/bin/tor-vpn
+sudo rm /usr/local/lib/tor-vpn-cleanup.sh
+sudo rm /etc/xdg/autostart/tor-vpn-gui.desktop
+sudo rm -f /etc/systemd/resolved.conf.d/tor-vpn-split.conf
+sudo rm -rf /etc/tor-vpn-manager
+sudo systemctl daemon-reload
+sudo resolvectl reload
+```
