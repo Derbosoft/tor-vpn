@@ -1,6 +1,6 @@
 from pathlib import Path
 
-VERSION       = "3.4.0"
+VERSION       = "3.5.0"
 SCRIPT_DIR    = Path(__file__).resolve().parent
 PROVIDERS_DIR = SCRIPT_DIR / "providers"
 CONFIG_DIR    = Path("/etc/tor-vpn-manager")
@@ -9,18 +9,15 @@ AUTH_TMP      = CONFIG_DIR / "auth.tmp"
 TORRC_FILE    = CONFIG_DIR / "torrc"
 
 SERVICE_NAME  = "tor-vpn-manager"
+STATUS_SOCKET = Path("/run/tor-vpn-manager.sock")
 
 DEFAULT_CONFIG = {
     "providers":         [],
-    "mode":              "tor+vpn",
     "auto_reconnect":    True,
     "block_ipv6":        False,
     "excluded_ips":      [],
     "excluded_domains":  [],
     "local_dns":         "",
-    "tor_min_speed_kbs": 50,
-    "vpn_min_speed_kbs": 100,
-    "speed_fail_count":  3,
     "lan_iface":         "",
     "lan_gateway":       "10.0.0.1",
     "lan_subnet":        "10.0.0.0/24",

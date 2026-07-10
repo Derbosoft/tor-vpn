@@ -37,12 +37,27 @@ apt-get install -y tor openvpn python3 python3-tk dnsutils dnsmasq curl
 
 # ── [2/6] Répertoire de configuration ───────────────────────────────────────
 echo "[2/6] Répertoire de configuration …"
+
+# Groupe torvpn : permet au GUI de tourner SANS root (config + providers
+# accessibles en écriture, actions systemctl via pkexec/polkit).
+groupadd -f torvpn
+if [ -n "$REAL_USER" ] && [ "$REAL_USER" != "root" ]; then
+    usermod -aG torvpn "$REAL_USER"
+    echo "    Utilisateur '$REAL_USER' ajouté au groupe torvpn"
+    echo "    (déconnexion/reconnexion nécessaire pour prise d'effet)"
+fi
+
 mkdir -p "$CONFIG_DIR"
-chmod 700 "$CONFIG_DIR"
+chown root:torvpn "$CONFIG_DIR"
+chmod 2770 "$CONFIG_DIR"            # setgid : fichiers créés → groupe torvpn
+find "$CONFIG_DIR" -maxdepth 1 -type f -exec chgrp torvpn {} + 2>/dev/null || true
+find "$CONFIG_DIR" -maxdepth 1 -type f -exec chmod g+rw {} + 2>/dev/null || true
 echo "$SCRIPT_DIR" > "$CONFIG_DIR/install_dir"
-echo "    Créé : $CONFIG_DIR"
+echo "    Créé : $CONFIG_DIR (root:torvpn, 2770)"
 
 mkdir -p "$SCRIPT_DIR/providers"
+chown root:torvpn "$SCRIPT_DIR/providers"
+chmod 2770 "$SCRIPT_DIR/providers"
 
 # Migration depuis une installation précédente
 for OLD in "/root/.config/tor-vpn-manager" "/home/$REAL_USER/.config/tor-vpn-manager" \
@@ -52,6 +67,39 @@ for OLD in "/root/.config/tor-vpn-manager" "/home/$REAL_USER/.config/tor-vpn-man
         cp "$OLD/config.json" "$CONFIG_DIR/config.json"
     fi
 done
+
+# torrc par défaut (circuits longs et stables, mêmes valeurs que les défauts
+# de l'onglet Tor du GUI).  Créé UNIQUEMENT s'il n'existe pas : une
+# réinstallation ne doit jamais écraser un torrc personnalisé.
+TORRC_FILE="$CONFIG_DIR/torrc"
+if [ ! -f "$TORRC_FILE" ]; then
+    cat > "$TORRC_FILE" << 'TORRC_EOF'
+# === Paramètres obligatoires — ne pas supprimer ===
+SocksPort 9050
+ControlPort 9051
+CookieAuthentication 1
+DataDirectory /etc/tor-vpn-manager/tor_data
+
+# === Paramètres personnalisés ===
+AvoidDiskWrites 1
+SafeLogging 1
+ClientUseIPv6 0
+TestSocks 1
+LongLivedPorts 1194,443
+LearnCircuitBuildTimeout 0
+MaxCircuitDirtiness 3600
+CircuitBuildTimeout 60
+NewCircuitPeriod 60
+KeepalivePeriod 60
+NumEntryGuards 3
+GuardLifetime 2 months
+TORRC_EOF
+    chown root:torvpn "$TORRC_FILE"
+    chmod 660 "$TORRC_FILE"
+    echo "    torrc par défaut créé : $TORRC_FILE"
+else
+    echo "    torrc existant conservé : $TORRC_FILE"
+fi
 
 # ── [3/6] Services système ───────────────────────────────────────────────────
 echo "[3/6] Configuration des services système …"
@@ -88,7 +136,9 @@ ip6tables -X TORVPN_KS6_FWD            2>/dev/null
 while iptables  -D FORWARD -j TORVPN_LAN_FWD 2>/dev/null; do :; done
 iptables  -F TORVPN_LAN_FWD            2>/dev/null
 iptables  -X TORVPN_LAN_FWD            2>/dev/null
-pkill -x dnsmasq                         2>/dev/null
+# dnsmasq du partage LAN uniquement, ciblé via son --pid-file unique
+# (jamais « pkill dnsmasq » : cela tuerait aussi ceux de libvirt/virbr0)
+pkill -f /etc/tor-vpn-manager/tor-vpn-dnsmasq.pid 2>/dev/null
 # NAT masquerade du partage LAN
 CONFIG_JSON="/etc/tor-vpn-manager/config.json"
 if [ -f "$CONFIG_JSON" ]; then
@@ -115,7 +165,12 @@ Wants=network-online.target
 StartLimitIntervalSec=0
 
 [Service]
-Type=simple
+# Type=notify + WatchdogSec : le daemon envoie READY=1 au démarrage puis
+# WATCHDOG=1 toutes les ~3s depuis sa boucle de monitoring.  Si le processus
+# gèle (plus de pings pendant 90s), systemd le tue et le relance.
+Type=notify
+NotifyAccess=main
+WatchdogSec=90
 User=root
 WorkingDirectory=$SCRIPT_DIR
 ExecStartPre=$CLEANUP_SCRIPT
@@ -170,7 +225,8 @@ echo "    CLI : $CLI_BIN"
 # pkexec) lancé à CHAQUE ouverture de session. On le supprime.
 rm -f "$OLD_AUTOSTART"
 
-# Exec via le wrapper tor-vpn : il gère pkexec + DISPLAY/XAUTHORITY.
+# Exec via le wrapper tor-vpn : il retrouve le répertoire d'installation
+# et lance le GUI en utilisateur normal (groupe torvpn).
 cat > "$DESKTOP_FILE" << DESKTOP_EOF
 [Desktop Entry]
 Version=1.0
@@ -218,6 +274,7 @@ systemctl is-enabled tor &>/dev/null \
 systemctl is-enabled tor-vpn-manager &>/dev/null && echo "  OK  démarrage auto activé"
 [ -x "$CLI_BIN" ]                  && echo "  OK  commande tor-vpn disponible"
 [ -f "$CONFIG_DIR/install_dir" ]   && echo "  OK  install_dir : $(cat $CONFIG_DIR/install_dir)"
+[ -f "$CONFIG_DIR/torrc" ]         && echo "  OK  torrc présent"
 
 echo "────────────────────────────────────────────────────────"
 echo ""
@@ -235,8 +292,8 @@ echo "╚═══════════════════════�
 echo ""
 echo "  Ouvrir l'interface de configuration :"
 echo ""
-echo "       tor-vpn gui"
-echo "    ou sudo python3 $SCRIPT_DIR/main.py"
+echo "       tor-vpn gui        (sans sudo — groupe torvpn)"
+echo "    ou python3 $SCRIPT_DIR/main.py"
 echo ""
 echo "  Démarrer le service :"
 echo ""

@@ -14,3 +14,8 @@ auth.tmp
 # (ajouter ses propres fichiers via le GUI après installation)
 providers/*/
 !providers/.gitkeep
+
+# Artefacts de travail locaux — jamais dans le dépôt
+.backup-avant-correctif-*/
+merge-ivpn.py
+.claude/

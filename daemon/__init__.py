@@ -8,6 +8,7 @@ La classe Daemon hérite de tous les mixins :
   FirewallMixin — iptables / ip6tables, partage LAN, dnsmasq
   DNSMixin     — split DNS systemd-resolved
   OpenVPNMixin — boucle OpenVPN, failover
+  StatusMixin  — socket Unix d'état (lecture seule)
   WatchdogMixin — surveillance connectivité/débit, redémarrage
 """
 
@@ -21,6 +22,7 @@ from .network   import NetworkMixin
 from .firewall  import FirewallMixin
 from .dns       import DNSMixin
 from .openvpn   import OpenVPNMixin
+from .status    import StatusMixin
 from .watchdog  import WatchdogMixin
 
 
@@ -31,6 +33,7 @@ class Daemon(
     FirewallMixin,
     DNSMixin,
     OpenVPNMixin,
+    StatusMixin,
     WatchdogMixin,
 ):
     """Daemon Tor-VPN : réunit tous les mixins."""

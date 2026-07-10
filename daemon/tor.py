@@ -36,6 +36,16 @@ class TorMixin:
             _run("pkill", "-x", "tor")
             time.sleep(2)
 
+        # Attendre la sortie de l'ancien thread _run_tor AVANT de remettre
+        # _stop_tor_flag à False : sinon l'ancien thread, encore dans son
+        # attente de reconnexion, repartirait → deux processus Tor.
+        if self._tor_thread and self._tor_thread.is_alive():
+            self._tor_thread.join(timeout=10)
+            if self._tor_thread.is_alive():
+                self._log("[tor] Ancien thread Tor toujours actif — "
+                          "démarrage annulé.", "ERROR")
+                return
+
         TOR_DATA_DIR.mkdir(parents=True, exist_ok=True)
         self._tor_ready.clear()
         self._stop_tor_flag = False
@@ -103,7 +113,81 @@ class TorMixin:
                         return
                     time.sleep(1)
 
-        threading.Thread(target=_run_tor, daemon=True).start()
+        self._tor_thread = threading.Thread(target=_run_tor, daemon=True)
+        self._tor_thread.start()
+
+
+    # ── ControlPort ───────────────────────────────────────────────────────────
+
+    def _tor_ctrl(self, *commands, timeout: float = 3.0) -> str:
+        """Envoie une ou plusieurs commandes au ControlPort (auth cookie)
+        et renvoie la réponse brute.  Lève OSError en cas d'échec réseau."""
+        auth = b"AUTHENTICATE\r\n"
+        try:
+            if TOR_COOKIE.exists():
+                auth = b"AUTHENTICATE " + TOR_COOKIE.read_bytes().hex().encode() + b"\r\n"
+        except Exception:
+            pass
+        with socket.socket() as s:
+            s.settimeout(timeout)
+            s.connect(("127.0.0.1", TOR_CTRL_PORT))
+            s.sendall(auth)
+            if b"250" not in s.recv(256):
+                raise OSError("authentification ControlPort refusée")
+            out = []
+            for cmd in commands:
+                s.sendall(cmd.encode() + b"\r\n")
+                buf = b""
+                while True:
+                    chunk = s.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+                    # Fin de réponse : ligne de statut « 250 … » ou « 5xx … »
+                    if b"\r\n250 " in buf or buf.endswith(b"250 OK\r\n") \
+                       or b"\r\n5" in buf[-64:]:
+                        break
+                out.append(buf.decode(errors="ignore"))
+            s.sendall(b"QUIT\r\n")
+            return "\n".join(out)
+
+    def _tor_bootstrap_progress(self) -> int:
+        """Progression du bootstrap (0-100) via GETINFO, -1 si indisponible."""
+        try:
+            resp = self._tor_ctrl("GETINFO status/bootstrap-phase")
+            for tok in resp.split():
+                if tok.startswith("PROGRESS="):
+                    return int(tok.split("=", 1)[1])
+        except Exception:
+            pass
+        return -1
+
+    def _tor_relay_ips(self) -> set:
+        """IPs IPv4 des relais auxquels Tor est connecté, via le ControlPort
+        (orconn-status → ns/id/<fingerprint>).  Ensemble vide en cas d'échec :
+        l'appelant peut alors se replier sur l'inspection des sockets (ss)."""
+        ips = set()
+        try:
+            resp = self._tor_ctrl("GETINFO orconn-status")
+            fps = []
+            for line in resp.splitlines():
+                line = line.strip().lstrip("250+-").strip()
+                if line.startswith("$") and "CONNECTED" in line:
+                    fps.append(line[1:].split("~")[0].split("=")[0].split()[0])
+            for fp in fps[:32]:                      # borne de sécurité
+                ns = self._tor_ctrl(f"GETINFO ns/id/${fp}")
+                # Ligne « r … <IP> <ORPort> <DirPort> » : l'IP est le 3e champ
+                # en partant de la fin — valable pour les deux formats de
+                # consensus (ns : 9 champs avec digest ; microdesc : 8 champs
+                # sans digest, le défaut des clients Tor).
+                for line in ns.splitlines():
+                    w = line.strip().split()
+                    if len(w) >= 8 and w[0] == "r":
+                        ips.add(w[-3])
+                        break
+        except Exception as e:
+            self._log(f"[tor-ctrl] relais indisponibles via ControlPort : {e}", "WARN")
+        return ips
 
     def _stop_tor(self):
         self._stop_tor_flag = True
@@ -120,27 +204,3 @@ class TorMixin:
             self._tor_ready.clear()
         else:
             _run("pkill", "-x", "tor")
-
-    def _new_tor_circuit(self):
-        try:
-            # Authentification par cookie (CookieAuthentication 1 est imposé,
-            # y compris dans le torrc généré par le GUI) ; repli sur AUTHENTICATE
-            # nu uniquement si le cookie est illisible.
-            auth = b"AUTHENTICATE\r\n"
-            try:
-                if TOR_COOKIE.exists():
-                    auth = b"AUTHENTICATE " + TOR_COOKIE.read_bytes().hex().encode() + b"\r\n"
-            except Exception:
-                pass
-            with socket.socket() as s:
-                s.settimeout(3)
-                s.connect(("127.0.0.1", TOR_CTRL_PORT))
-                s.sendall(auth + b"SIGNAL NEWNYM\r\n")
-                resp = s.recv(256).decode(errors="ignore")
-                if "250" in resp:
-                    self._log("Tor : nouveau circuit (NEWNYM).", "OK")
-                else:
-                    self._log(
-                        f"Tor NEWNYM : réponse inattendue ({resp.strip()[:40]})", "WARN")
-        except Exception as e:
-            self._log(f"Tor NEWNYM : {e}", "WARN")

@@ -5,10 +5,9 @@ Watchdog : surveillance de connectivité, débit, redémarrage automatique.
 import socket
 import subprocess
 import sys
-import threading
 import time
 
-from .core import _run, CONN_FAIL_MAX, REPAIR_THRESHOLD, SCRIPT_DIR
+from .core import _run, _sd_notify, CONN_FAIL_MAX, REPAIR_THRESHOLD, SCRIPT_DIR
 
 
 class WatchdogMixin:
@@ -20,23 +19,29 @@ class WatchdogMixin:
 
     _CONN_GRACE = 30  # secondes de grâce après tunnel up avant de vérifier la connectivité
 
+    # Deux endpoints indépendants (Cloudflare, Quad9) : une panne ponctuelle
+    # de l'un ne doit pas déclencher un redémarrage complet pour rien.
+    _CONN_ENDPOINTS = (("1.1.1.1", 443), ("9.9.9.9", 443))
+
     def _check_connectivity(self) -> bool:
         tun = self._tun_iface
         if _run("ip", "link", "show", tun).returncode != 0:
             return False
         if time.time() - self._tunnel_up_time < self._CONN_GRACE:
             return True
-        try:
-            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            s.setsockopt(socket.SOL_SOCKET,
-                         getattr(socket, "SO_BINDTODEVICE", 25),
-                         tun.encode() + b"\0")
-            s.settimeout(5)
-            s.connect(("1.1.1.1", 443))
-            s.close()
-            return True
-        except Exception:
-            return False
+        for host, port in self._CONN_ENDPOINTS:
+            try:
+                s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                s.setsockopt(socket.SOL_SOCKET,
+                             getattr(socket, "SO_BINDTODEVICE", 25),
+                             tun.encode() + b"\0")
+                s.settimeout(5)
+                s.connect((host, port))
+                s.close()
+                return True
+            except OSError:
+                continue
+        return False
 
     def _read_tun0_rx(self) -> int:
         tun = self._tun_iface
@@ -94,6 +99,8 @@ class WatchdogMixin:
             self._log("Watchdog : relance échouée (Tor ne démarre pas).", "ERROR")
 
     _GUARD_REFRESH_TICKS = 10   # ~30s (10 × 3s)
+    _INERT_WARN_TICKS    = 20   # ~60s  d'inertie → avertissement
+    _INERT_EXIT_TICKS    = 40   # ~120s d'inertie → sortie (relance systemd)
 
     def _monitor_loop(self):
         conn_tick  = 0
@@ -103,10 +110,42 @@ class WatchdogMixin:
             if self._stop_flag:
                 break
 
+            # Ping watchdog systemd (WatchdogSec=90) : émis par CETTE boucle
+            # uniquement — si elle gèle (deadlock, syscall suspendu), les
+            # pings cessent et systemd tue puis relance le daemon.
+            _sd_notify("WATCHDOG=1")
+
             rx   = self._read_tun0_rx()
             d_rx = max(0, rx - self._last_rx) if self._last_rx else 0
             self._last_rx    = rx
             self._rx_history = self._rx_history[1:] + [float(d_rx)]
+
+            # ── Filet anti-inertie ────────────────────────────────────────
+            # Les boucles Tor/OpenVPN abandonnent après un nombre borné de
+            # tentatives : sans ce filet, une longue coupure réseau laisserait
+            # le daemon vivant mais inerte pour toujours.  Si plus aucune
+            # boucle VPN ne tourne (et reconnexion auto active), on sort au
+            # bout de 2 min : systemd (Restart=on-failure, illimité) relance
+            # alors le daemon complet — aucune impasse n'est définitive.
+            with self._vpn_lock:
+                vpn_loop_alive = self._vpn_loop_active
+            if (self.config.get("auto_reconnect", True)
+                    and not vpn_loop_alive and not self._tunnel_up):
+                self._inert_ticks += 1
+                if self._inert_ticks == self._INERT_WARN_TICKS:
+                    self._log(
+                        "Watchdog : plus aucune boucle VPN active — sortie "
+                        "pour relance systemd dans "
+                        f"{(self._INERT_EXIT_TICKS - self._INERT_WARN_TICKS) * 3}s "
+                        "si rien ne repart.", "WARN")
+                elif self._inert_ticks >= self._INERT_EXIT_TICKS:
+                    self._log(
+                        "Watchdog : daemon inerte depuis "
+                        f"{self._INERT_EXIT_TICKS * 3}s — sortie pour relance "
+                        "complète par systemd.", "ERROR")
+                    sys.exit(1)
+            else:
+                self._inert_ticks = 0
 
             # Rafraîchit les routes /32 des guards Tor : si Tor change de
             # garde en cours de session, son IP doit rester routée hors
@@ -124,7 +163,6 @@ class WatchdogMixin:
             vpn_up = self._vpn_is_active()
             if not vpn_up or not self._tunnel_up:
                 self._conn_fail_count = 0
-                self._vpn_slow_count  = 0
                 continue
 
             if not self.config.get("auto_reconnect", True) or self._conn_restart_pending:
@@ -142,60 +180,3 @@ class WatchdogMixin:
                 if self._conn_fail_count >= CONN_FAIL_MAX and not self._stop_vpn:
                     self._conn_restart_pending = True
                     self._full_restart()
-                continue
-
-            vpn_min = self.config.get("vpn_min_speed_kbs", 0)
-            if vpn_min > 0 and not self._failover_in_progress:
-                bw_bps = (self._rx_history[-1] if self._rx_history else 0) / 3
-                if 0 < bw_bps < vpn_min * 1024:
-                    self._vpn_slow_count += 1
-                    if self._vpn_slow_count >= self.config.get("speed_fail_count", 3):
-                        self._vpn_slow_count = 0
-                        if self._try_failover():
-                            # _try_failover a déjà avancé les index : on les
-                            # capture pour relancer la boucle DESSUS (sinon
-                            # _openvpn_loop les remettrait à 0).
-                            target_p = self._current_provider_idx
-                            target_a = self._current_account_idx
-                            self._log(
-                                f"Débit VPN faible ({bw_bps/1024:.0f} KB/s) — failover …",
-                                "WARN")
-                            self._failover_in_progress = True
-
-                            def _do_fo(tp=target_p, ta=target_a):
-                                self._stop_vpn = True
-                                self._stop_openvpn()
-                                # Attendre la fin réelle de l'ancienne boucle
-                                # avant d'en démarrer une nouvelle : sinon le
-                                # garde-fou _vpn_loop_active rejetterait la
-                                # nouvelle boucle et le VPN resterait mort.
-                                if not self._wait_vpn_loop_exit(30):
-                                    self._log(
-                                        "Failover : l'ancienne boucle OpenVPN "
-                                        "ne s'arrête pas — failover annulé, "
-                                        "le watchdog reprendra.", "ERROR")
-                                    self._failover_in_progress = False
-                                    return
-                                self._failover_in_progress = False
-                                threading.Thread(
-                                    target=self._openvpn_loop,
-                                    kwargs={"start_provider_idx": tp,
-                                            "start_account_idx": ta},
-                                    daemon=True).start()
-                            threading.Thread(target=_do_fo, daemon=True).start()
-                else:
-                    self._vpn_slow_count = 0
-
-            tor_min = self.config.get("tor_min_speed_kbs", 0)
-            if tor_min > 0:
-                bw_bps = (self._rx_history[-1] if self._rx_history else 0) / 3
-                if 0 < bw_bps < tor_min * 1024:
-                    self._tor_slow_count += 1
-                    if self._tor_slow_count >= self.config.get("speed_fail_count", 3):
-                        self._tor_slow_count = 0
-                        self._log(
-                            f"Débit Tor faible ({bw_bps/1024:.0f} KB/s) — nouveau circuit …",
-                            "WARN")
-                        self._new_tor_circuit()
-                else:
-                    self._tor_slow_count = 0

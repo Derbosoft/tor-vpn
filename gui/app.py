@@ -4,7 +4,8 @@ Tor-VPN Manager — Interface graphique de configuration.
 Le daemon (tor-vpn-manager.service) gère Tor + OpenVPN de façon autonome.
 Ce GUI écrit la config, redémarre le service si demandé.
 
-Usage : sudo python3 main.py
+Usage : python3 main.py   (ou : tor-vpn gui — groupe torvpn, sans root ;
+les actions systemctl privilégiées passent par pkexec)
 """
 
 import base64
@@ -18,9 +19,11 @@ import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox, scrolledtext, simpledialog, ttk
 
+import socket as _socket
+
 from constants import (
     ACCENT, BG, BG2, BG3, CONFIG_DIR, CONFIG_FILE, DEFAULT_CONFIG,
-    FG, FONT, FONT_MONO, GRAY, GREEN, PROVIDERS_DIR, RED, SCRIPT_DIR,
+    FG, FONT, FONT_MONO, GRAY, GREEN, PROVIDERS_DIR, RED, SCRIPT_DIR, STATUS_SOCKET,
     SERVICE_NAME, TORRC_FILE, VERSION, YELLOW,
 )
 
@@ -72,17 +75,29 @@ class ConfigApp:
         return dict(DEFAULT_CONFIG)
 
     def _save_config(self):
-        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        CONFIG_DIR.chmod(0o700)
+        try:
+            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            # setgid : les fichiers créés héritent du groupe torvpn.
+            CONFIG_DIR.chmod(0o2770)
+        except PermissionError:
+            pass   # non-root : le répertoire appartient à root:torvpn (install.sh)
         # Écriture atomique : tmp + fsync + rename, pour ne jamais laisser
         # un config.json tronqué en cas de crash/coupure.
         tmp = CONFIG_FILE.with_name(CONFIG_FILE.name + ".tmp")
-        with open(tmp, "w") as f:
-            json.dump(self.config, f, indent=2, ensure_ascii=False)
-            f.flush()
-            os.fsync(f.fileno())
-        tmp.chmod(0o600)
-        os.replace(tmp, CONFIG_FILE)
+        try:
+            with open(tmp, "w") as f:
+                json.dump(self.config, f, indent=2, ensure_ascii=False)
+                f.flush()
+                os.fsync(f.fileno())
+            tmp.chmod(0o660)   # lisible/inscriptible par root + groupe torvpn
+            os.replace(tmp, CONFIG_FILE)
+        except PermissionError:
+            messagebox.showerror(
+                "Droits insuffisants",
+                f"Impossible d'écrire {CONFIG_FILE}.\n\n"
+                "Relancez « sudo bash install.sh » pour créer le groupe "
+                "torvpn, puis déconnectez/reconnectez votre session.")
+            raise
 
     # ── Construction UI ───────────────────────────────────────────────────────
 
@@ -206,13 +221,53 @@ class ConfigApp:
 
     # ── Statut service ────────────────────────────────────────────────────────
 
+    # ── systemctl (pkexec si non-root) ────────────────────────────────────────
+
+    @staticmethod
+    def _systemctl(*args) -> "subprocess.CompletedProcess":
+        """Exécute systemctl, via pkexec si le GUI ne tourne pas en root.
+        La lecture d'état (is-active…) reste directe : elle ne requiert
+        aucun privilège."""
+        cmd = ["systemctl", *args]
+        if os.geteuid() != 0 and args and args[0] not in (
+                "is-active", "is-enabled", "show", "status"):
+            cmd = ["pkexec"] + cmd
+        return subprocess.run(cmd, capture_output=True, text=True)
+
+    def _read_daemon_status(self) -> dict:
+        """Lit l'état exposé par le daemon sur son socket Unix (lecture
+        seule).  Dict vide si le daemon ne tourne pas."""
+        try:
+            with _socket.socket(_socket.AF_UNIX, _socket.SOCK_STREAM) as sk:
+                sk.settimeout(1.5)
+                sk.connect(str(STATUS_SOCKET))
+                buf = b""
+                while not buf.endswith(b"\n"):
+                    chunk = sk.recv(4096)
+                    if not chunk:
+                        break
+                    buf += chunk
+            return json.loads(buf.decode())
+        except Exception:
+            return {}
+
     def _refresh_status(self):
-        r = subprocess.run(["systemctl", "is-active", SERVICE_NAME],
-                           capture_output=True, text=True)
+        r = self._systemctl("is-active", SERVICE_NAME)
         state = r.stdout.strip()
         if state == "active":
+            st = self._read_daemon_status()
+            if st.get("tunnel_up"):
+                info = (f" Actif — tunnel {st.get('tunnel_iface','?')} UP"
+                        f" · {st.get('provider','?')}"
+                        f" · {st.get('rx_kbs',0):.0f} KB/s")
+            elif st.get("tor_ready"):
+                info = " Actif — Tor prêt, VPN en connexion …"
+            elif st:
+                info = " Actif — bootstrap Tor …"
+            else:
+                info = " Actif"
             self._svc_dot.config(fg=GREEN)
-            self._svc_lbl.config(fg=GREEN,  text=" Actif")
+            self._svc_lbl.config(fg=GREEN,  text=info)
         elif state in ("failed", "error"):
             self._svc_dot.config(fg=RED)
             self._svc_lbl.config(fg=RED,    text=f" {state.capitalize()}")
@@ -228,24 +283,21 @@ class ConfigApp:
         self.root.after(5000, self._poll_status)
 
     def _svc_start(self):
-        subprocess.run(["systemctl", "reset-failed", SERVICE_NAME], capture_output=True)
-        r = subprocess.run(["systemctl", "start", SERVICE_NAME],
-                           capture_output=True, text=True)
+        # Pas de « reset-failed » préalable : inutile (StartLimitIntervalSec=0
+        # dans l'unité) et il doublerait l'invite pkexec en non-root.
+        r = self._systemctl("start", SERVICE_NAME)
         self.root.after(1500, self._refresh_status)
         if r.returncode != 0:
             messagebox.showerror("Erreur", r.stderr.strip() or "Impossible de démarrer.")
 
     def _svc_stop(self):
-        r = subprocess.run(["systemctl", "stop", SERVICE_NAME],
-                           capture_output=True, text=True)
+        r = self._systemctl("stop", SERVICE_NAME)
         self.root.after(1000, self._refresh_status)
         if r.returncode != 0:
             messagebox.showerror("Erreur", r.stderr.strip() or "Impossible d'arrêter.")
 
     def _svc_restart(self):
-        subprocess.run(["systemctl", "reset-failed", SERVICE_NAME], capture_output=True)
-        r = subprocess.run(["systemctl", "restart", SERVICE_NAME],
-                           capture_output=True, text=True)
+        r = self._systemctl("restart", SERVICE_NAME)
         self.root.after(2000, self._refresh_status)
         if r.returncode != 0:
             messagebox.showerror("Erreur", r.stderr.strip() or "Impossible de redémarrer.")
@@ -253,19 +305,12 @@ class ConfigApp:
     # ── Sauvegarde ────────────────────────────────────────────────────────────
 
     def _collect_config(self):
-        self.config["mode"]             = "tor+vpn"
         self.config["excluded_ips"]     = list(self.ip_list.get(0, tk.END))
         self.config["excluded_domains"] = list(self.domain_list.get(0, tk.END))
         self.config["local_dns"]        = self.dns_var.get().strip()
         self.config["auto_reconnect"]   = self.auto_reconnect_var.get()
         self.config["block_ipv6"]       = self.block_ipv6_var.get()
         self.config["autostart"]        = self.autostart_var.get()
-        try:
-            self.config["vpn_min_speed_kbs"] = int(self.vpn_speed_var.get())
-            self.config["tor_min_speed_kbs"] = int(self.tor_speed_var.get())
-            self.config["speed_fail_count"]  = int(self.speed_fail_var.get())
-        except ValueError:
-            pass
         self.config["lan_iface"]    = self.lan_iface_var.get().strip()
         self.config["lan_gateway"]  = self.lan_gateway_var.get().strip()
         self.config["lan_subnet"]   = self.lan_subnet_var.get().strip()
@@ -296,9 +341,6 @@ class ConfigApp:
         self.auto_reconnect_var.set(self.config.get("auto_reconnect", True))
         self.block_ipv6_var.set(self.config.get("block_ipv6", False))
         self.autostart_var.set(self.config.get("autostart", False))
-        self.vpn_speed_var.set(str(self.config.get("vpn_min_speed_kbs", 100)))
-        self.tor_speed_var.set(str(self.config.get("tor_min_speed_kbs", 50)))
-        self.speed_fail_var.set(str(self.config.get("speed_fail_count", 3)))
         self.lan_iface_var.set(self.config.get("lan_iface", ""))
         self.lan_gateway_var.set(self.config.get("lan_gateway", "10.0.0.1"))
         self.lan_subnet_var.set(self.config.get("lan_subnet", "10.0.0.0/24"))
@@ -710,31 +752,6 @@ class ConfigApp:
                         text="Reconnexion automatique si la connexion tombe",
                         variable=self.auto_reconnect_var).pack(anchor=tk.W, pady=2)
 
-        spd_frame = self._lf(parent, "Seuils de débit  (0 = désactivé)")
-        row1 = self._row(spd_frame)
-        ttk.Label(row1, text="Débit min VPN :", width=22).pack(side=tk.LEFT)
-        self.vpn_speed_var = tk.StringVar(value="100")
-        ttk.Spinbox(row1, from_=0, to=100000, increment=10, width=7,
-                    textvariable=self.vpn_speed_var).pack(side=tk.LEFT, padx=4)
-        tk.Label(row1, text="KB/s → changer fournisseur",
-                 fg=GRAY, bg=BG, font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=4)
-
-        row2 = self._row(spd_frame)
-        ttk.Label(row2, text="Débit min Tor :", width=22).pack(side=tk.LEFT)
-        self.tor_speed_var = tk.StringVar(value="50")
-        ttk.Spinbox(row2, from_=0, to=10000, increment=10, width=7,
-                    textvariable=self.tor_speed_var).pack(side=tk.LEFT, padx=4)
-        tk.Label(row2, text="KB/s → nouveau circuit",
-                 fg=GRAY, bg=BG, font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=4)
-
-        row3 = self._row(spd_frame)
-        ttk.Label(row3, text="Mesures consécutives :", width=22).pack(side=tk.LEFT)
-        self.speed_fail_var = tk.StringVar(value="3")
-        ttk.Spinbox(row3, from_=1, to=30, increment=1, width=7,
-                    textvariable=self.speed_fail_var).pack(side=tk.LEFT, padx=4)
-        tk.Label(row3, text="avant action",
-                 fg=GRAY, bg=BG, font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=4)
-
         sys_frame = self._lf(parent, "Système")
         self.autostart_var = tk.BooleanVar()
         ttk.Checkbutton(sys_frame, text="Lancer le service automatiquement au démarrage",
@@ -765,9 +782,12 @@ class ConfigApp:
             messagebox.showerror("Introuvable", f"{script} introuvable.")
             return
         try:
+            # Le script exige root : pkexec quand le GUI tourne en non-root.
+            cmd = ["bash", str(script)]
+            if os.geteuid() != 0:
+                cmd = ["pkexec"] + cmd
             subprocess.Popen(
-                ["bash", str(script)],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             messagebox.showinfo(
                 "Réparation lancée",
                 "repair_network.sh lancé.\n"
@@ -929,10 +949,8 @@ class ConfigApp:
     def _refresh_lan_interfaces(self):
         uplink = self._uplink_iface()
         try:
-            result = subprocess.run(["ls", "/sys/class/net"],
-                                     capture_output=True, text=True)
-            ifaces = [i for i in result.stdout.split()
-                      if i not in ("lo",) and i != uplink and
+            ifaces = [i for i in sorted(os.listdir("/sys/class/net"))
+                      if i != "lo" and i != uplink and
                       not i.startswith(("tun", "virbr", "docker", "wg", "veth", "br-"))]
         except Exception:
             ifaces = []
@@ -944,45 +962,27 @@ class ConfigApp:
     # ── Autostart ─────────────────────────────────────────────────────────────
 
     def _set_autostart(self, enabled: bool):
-        action = "enable" if enabled else "disable"
-        subprocess.run(["systemctl", action, SERVICE_NAME], capture_output=True)
-        self.config["autostart"] = enabled
-        self._save_config()
+        # is-enabled est une lecture sans privilège : on ne déclenche
+        # enable/disable (pkexec en non-root) que si l'état doit changer.
+        cur = self._systemctl("is-enabled", SERVICE_NAME).stdout.strip() == "enabled"
+        if cur == enabled:
+            return
+        self._systemctl("enable" if enabled else "disable", SERVICE_NAME)
 
     # ── Onglet Tor (torrc) ────────────────────────────────────────────────────
 
-    _TOR_PROFILES = {
-        "stable": {
-            "avoid_disk":     True,  "safe_logging":   True,
-            "no_ipv6":        True,  "test_socks":     True,
-            "conn_padding":   False, "long_lived":     True,
-            "learn_timeout":  True,  "max_dirty":      3600,
-            "build_timeout":  60,    "new_circuit":    60,
-            "keepalive":      60,    "num_guards":     3,
-            "guard_lifetime": "2 months",
-            "exclude_exits":  "",    "strict_nodes":   False,
-        },
-        "anonymat": {
-            "avoid_disk":     True,  "safe_logging":   True,
-            "no_ipv6":        True,  "test_socks":     True,
-            "conn_padding":   True,  "long_lived":     True,
-            "learn_timeout":  True,  "max_dirty":      3600,
-            "build_timeout":  60,    "new_circuit":    120,
-            "keepalive":      60,    "num_guards":     3,
-            "guard_lifetime": "2 months",
-            "exclude_exits":  "{us},{gb},{ca},{au},{nz}",
-            "strict_nodes":   False,
-        },
-        "performance": {
-            "avoid_disk":     True,  "safe_logging":   False,
-            "no_ipv6":        True,  "test_socks":     False,
-            "conn_padding":   False, "long_lived":     True,
-            "learn_timeout":  True,  "max_dirty":      600,
-            "build_timeout":  15,    "new_circuit":    30,
-            "keepalive":      30,    "num_guards":     2,
-            "guard_lifetime": "1 months",
-            "exclude_exits":  "",    "strict_nodes":   False,
-        },
+    # Valeurs par défaut du torrc (circuits longs et stables, adaptées à un
+    # tunnel OpenVPN persistant).  Chaque option reste ajustable via les
+    # widgets ci-dessous ou le mode expert.
+    _TOR_DEFAULTS = {
+        "avoid_disk":     True,  "safe_logging":   True,
+        "no_ipv6":        True,  "test_socks":     True,
+        "conn_padding":   False, "long_lived":     True,
+        "learn_timeout":  True,  "max_dirty":      3600,
+        "build_timeout":  60,    "new_circuit":    60,
+        "keepalive":      60,    "num_guards":     3,
+        "guard_lifetime": "2 months",
+        "exclude_exits":  "",    "strict_nodes":   False,
     }
 
     _TORRC_MANDATORY = (
@@ -994,42 +994,8 @@ class ConfigApp:
     )
 
     def _build_tor_tab(self, parent):
-        # ── Layout : options en haut, expert en bas ────────────────────────
-        top = tk.Frame(parent, bg=BG)
-        top.pack(fill=tk.BOTH, expand=True)
-
-        # Scrollable pour les options
-        canvas = tk.Canvas(top, bg=BG, bd=0, highlightthickness=0)
-        vsb    = ttk.Scrollbar(top, orient="vertical", command=canvas.yview)
-        canvas.configure(yscrollcommand=vsb.set)
-        vsb.pack(side=tk.RIGHT, fill=tk.Y)
-        canvas.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-        opts_frame = ttk.Frame(canvas, padding=4)
-        win_id = canvas.create_window((0, 0), window=opts_frame, anchor="nw")
-        opts_frame.bind("<Configure>", lambda e: canvas.configure(
-            scrollregion=canvas.bbox("all")))
-        canvas.bind("<Configure>", lambda e: canvas.itemconfig(win_id, width=e.width))
-
-        def _enter(e):
-            canvas.bind_all("<Button-4>",  lambda ev: canvas.yview_scroll(-1, "units"))
-            canvas.bind_all("<Button-5>",  lambda ev: canvas.yview_scroll(1,  "units"))
-        def _leave(e):
-            canvas.unbind_all("<Button-4>")
-            canvas.unbind_all("<Button-5>")
-        canvas.bind("<Enter>", _enter)
-        canvas.bind("<Leave>", _leave)
-
-        # ── Profil ─────────────────────────────────────────────────────────
-        pf = ttk.LabelFrame(opts_frame, text="  Profil  ", padding=8)
-        pf.pack(fill=tk.X, pady=4)
-        self._tor_profile_var = tk.StringVar(value="stable")
-        for key, label in [
-            ("stable",      "VPN Stable — circuits longs et stables (recommandé)"),
-            ("anonymat",    "Anonymat renforcé — padding + exclusion Five Eyes"),
-            ("performance", "Performance — circuits courts et rapides"),
-        ]:
-            ttk.Radiobutton(pf, text=label, variable=self._tor_profile_var,
-                            value=key, command=self._on_tor_profile).pack(anchor=tk.W, pady=1)
+        # Zone scrollable commune (options + expert + actions)
+        opts_frame = self._scrollable(parent)
 
         # ── Circuit ────────────────────────────────────────────────────────
         circ = ttk.LabelFrame(opts_frame, text="  Circuit  ", padding=8)
@@ -1142,15 +1108,12 @@ class ConfigApp:
         self._tor_status_lbl.pack(anchor=tk.W, pady=(6, 0))
 
         # ── Init ───────────────────────────────────────────────────────────
-        self._on_tor_profile()
+        self._set_tor_defaults()
         if TORRC_FILE.exists():
             self._load_torrc_file()
 
-    def _on_tor_profile(self):
-        key  = self._tor_profile_var.get()
-        prof = self._TOR_PROFILES.get(key, {})
-        if not prof:
-            return
+    def _set_tor_defaults(self):
+        prof = self._TOR_DEFAULTS
         self._tor_avoid_disk_var.set(prof["avoid_disk"])
         self._tor_safe_logging_var.set(prof["safe_logging"])
         self._tor_no_ipv6_var.set(prof["no_ipv6"])
@@ -1230,16 +1193,17 @@ class ConfigApp:
         # Garantit les paramètres obligatoires, clé par clé : on n'ajoute que
         # les lignes réellement manquantes (préfixer tout le bloc dupliquerait
         # SocksPort/ControlPort → conflit de bind, Tor refuserait de démarrer).
-        # Les lignes commentées sont ignorées lors de la détection.
+        # Les lignes commentées sont ignorées ; comparaison insensible à la
+        # casse (les clés torrc le sont pour Tor).
         present = {
-            ln.strip().split()[0]
+            ln.strip().split()[0].lower()
             for ln in content.splitlines()
             if ln.strip() and not ln.strip().startswith("#")
         }
         missing = [
             ln for ln in self._TORRC_MANDATORY.splitlines()
             if ln.strip() and not ln.startswith("#")
-            and ln.split()[0] not in present
+            and ln.split()[0].lower() not in present
         ]
         if missing:
             content = ("# === Paramètres obligatoires (réinjectés) ===\n"
@@ -1247,7 +1211,10 @@ class ConfigApp:
         try:
             CONFIG_DIR.mkdir(parents=True, exist_ok=True)
             TORRC_FILE.write_text(content)
-            TORRC_FILE.chmod(0o600)
+            try:
+                TORRC_FILE.chmod(0o660)
+            except PermissionError:
+                pass
             self._tor_status_lbl.config(
                 text="torrc sauvegardé — redémarrage du service …", fg=YELLOW)
             self._svc_restart()
@@ -1256,7 +1223,8 @@ class ConfigApp:
             self.root.after(7000, lambda: self._tor_status_lbl.config(text=""))
         except PermissionError:
             self._tor_status_lbl.config(
-                text="Erreur : droits insuffisants (relancez avec sudo).", fg=RED)
+                text="Erreur : droits insuffisants — relancez install.sh "
+                     "(groupe torvpn) puis reconnectez votre session.", fg=RED)
         except Exception as e:
             self._tor_status_lbl.config(text=f"Erreur : {e}", fg=RED)
 
@@ -1267,8 +1235,7 @@ class ConfigApp:
             return
         try:
             TORRC_FILE.unlink(missing_ok=True)
-            self._tor_profile_var.set("stable")
-            self._on_tor_profile()
+            self._set_tor_defaults()
             self._tor_status_lbl.config(
                 text="torrc supprimé — redémarrage avec config minimale …", fg=YELLOW)
             self._svc_restart()
@@ -1277,7 +1244,8 @@ class ConfigApp:
             self.root.after(7000, lambda: self._tor_status_lbl.config(text=""))
         except PermissionError:
             self._tor_status_lbl.config(
-                text="Erreur : droits insuffisants (relancez avec sudo).", fg=RED)
+                text="Erreur : droits insuffisants — relancez install.sh "
+                     "(groupe torvpn) puis reconnectez votre session.", fg=RED)
         except Exception as e:
             self._tor_status_lbl.config(text=f"Erreur : {e}", fg=RED)
 

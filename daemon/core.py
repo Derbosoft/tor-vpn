@@ -5,7 +5,7 @@ Daemon core : constantes, helpers, initialisation, run(), handle_signal().
 import base64
 import json
 import os
-import signal
+import socket
 import subprocess
 import sys
 import threading
@@ -13,8 +13,7 @@ import time
 from pathlib import Path
 
 # ── Imports projet ────────────────────────────────────────────────────────────
-import sys as _sys
-_sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from constants import CONFIG_DIR, CONFIG_FILE, AUTH_TMP, PROVIDERS_DIR, SCRIPT_DIR, DEFAULT_CONFIG, TORRC_FILE, VERSION
 
 # ── Constantes daemon ─────────────────────────────────────────────────────────
@@ -46,6 +45,23 @@ def _deobf(s: str) -> str:
     except Exception:
         return s
 
+def _sd_notify(msg: str):
+    """Notification systemd (READY=1, WATCHDOG=1, STOPPING=1) sans dépendance.
+    No-op silencieux hors systemd (NOTIFY_SOCKET absent) — le daemon reste
+    lançable à la main pour le debug."""
+    path = os.environ.get("NOTIFY_SOCKET")
+    if not path:
+        return
+    try:
+        if path.startswith("@"):          # socket abstrait
+            path = "\0" + path[1:]
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+        s.connect(path)
+        s.send(msg.encode())
+        s.close()
+    except Exception:
+        pass
+
 
 # ── DaemonCore ────────────────────────────────────────────────────────────────
 
@@ -57,6 +73,7 @@ class DaemonCore:
 
         self.tor_process     = None
         self.openvpn_process = None
+        self._tor_thread     = None
 
         self._tor_ready          = threading.Event()
         self._vpn_lock           = threading.Lock()
@@ -72,13 +89,13 @@ class DaemonCore:
         self._current_account_idx  = 0
         self._reconnect_vpn_count  = 0
         self._reconnect_tor_count  = 0
-        self._failover_in_progress = False
-        self._vpn_slow_count       = 0
-        self._tor_slow_count       = 0
 
         self._conn_fail_count      = 0
         self._conn_restart_pending = False
         self._full_restart_count   = 0
+        self._inert_ticks          = 0
+
+        self._vpn_dns_ips    = []
 
         self._tun_iface      = "tun0"
         self._tunnel_up      = False
@@ -121,16 +138,19 @@ class DaemonCore:
     # ── Signal ────────────────────────────────────────────────────────────────
 
     def handle_signal(self, signum, _frame):
+        _sd_notify("STOPPING=1")
         self._log(f"Signal {signum} reçu — arrêt propre …", "WARN")
         self._stop_flag     = True
         self._stop_vpn      = True
         self._stop_tor_flag = True
         self._stop_openvpn()
         self._stop_tor()
+        self._revert_vpn_dns()
         self._cleanup_tor_routes()
         self._teardown_lan_sharing()
         self._ipv6_block_off()
         self._remove_dns_split()
+        self._stop_status_server()
         if AUTH_TMP.exists():
             AUTH_TMP.unlink()
         self._log("Daemon arrêté proprement.", "OK")
@@ -173,26 +193,46 @@ class DaemonCore:
             except Exception:
                 pass
 
-        if LAN_DNSMASQ_PID.exists():
-            try:
-                pid = int(LAN_DNSMASQ_PID.read_text().strip())
-                os.kill(pid, signal.SIGTERM)
-            except Exception:
-                pass
-            LAN_DNSMASQ_PID.unlink(missing_ok=True)
+        # dnsmasq orphelin du partage LAN : ciblé via son argument --pid-file
+        # unique (jamais « pkill dnsmasq » : cela tuerait ceux de libvirt).
+        _run("pkill", "-f", str(LAN_DNSMASQ_PID))
+        LAN_DNSMASQ_PID.unlink(missing_ok=True)
 
         self._cleanup_tor_routes()
         self._log("Nettoyage terminé.", "OK")
 
     # ── Démarrage des services ────────────────────────────────────────────────
 
+    def _wait_tor_ready(self, timeout: float) -> bool:
+        """Attend le bootstrap Tor : événement posé par le parsing stdout,
+        doublé d'un sondage du ControlPort (GETINFO status/bootstrap-phase),
+        plus fiable que la seule détection de « Bootstrapped 100% »."""
+        deadline  = time.time() + timeout
+        last_prog = -1
+        while time.time() < deadline and not self._stop_flag:
+            # Le bootstrap peut durer plusieurs minutes : on maintient le
+            # watchdog systemd pendant cette attente (sinon WatchdogSec
+            # tuerait un démarrage parfaitement sain).
+            _sd_notify("WATCHDOG=1")
+            if self._tor_ready.wait(2):
+                return True
+            prog = self._tor_bootstrap_progress()
+            if prog >= 100:
+                self._tor_ready.set()
+                self._log("[tor-ctrl] Bootstrap 100 % (ControlPort).", "OK")
+                return True
+            if prog > last_prog >= 0 or (prog >= 0 and last_prog < 0):
+                self._log(f"[tor-ctrl] Bootstrap {prog} % …")
+            last_prog = max(last_prog, prog)
+        return self._tor_ready.is_set()
+
     def _start_services(self) -> bool:
         self._start_tor()
         self._log("Attente du bootstrap Tor (max 240s) …")
-        ready = self._tor_ready.wait(90)
+        ready = self._wait_tor_ready(90)
         if not ready and self.tor_process and self.tor_process.poll() is None:
             self._log("Tor encore en bootstrap — attente prolongée (150s) …", "WARN")
-            ready = self._tor_ready.wait(150)
+            ready = self._wait_tor_ready(150)
         if not ready:
             self._log("Tor n'a pas démarré dans les temps.", "ERROR")
             return False
@@ -203,6 +243,9 @@ class DaemonCore:
 
     def run(self):
         self._log(f"Tor-VPN Manager daemon v{VERSION} démarré (PID {os.getpid()}).", "OK")
+        # READY tout de suite (Type=notify) : le « prêt » systemd signifie
+        # « le daemon orchestre », pas « le tunnel est monté ».
+        _sd_notify("READY=1")
         if not self.config.get("providers"):
             self._log(
                 "Aucun fournisseur configuré.\n"
@@ -210,6 +253,7 @@ class DaemonCore:
                 "Puis relancez :   tor-vpn restart", "ERROR")
             sys.exit(1)
         self.cleanup_stale_rules()
+        self._start_status_server()
         if not self._start_services():
             sys.exit(1)
         self._monitor_loop()

@@ -2,6 +2,7 @@
 Pare-feu : blocage IPv6 iptables/ip6tables, partage LAN.
 """
 
+import ipaddress
 import shutil
 import subprocess
 import threading
@@ -14,21 +15,6 @@ from .core import (
 
 
 class FirewallMixin:
-
-    # ── Helpers ───────────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _get_libvirt_bridges() -> list:
-        import glob as _gl
-        from pathlib import Path
-        try:
-            return sorted(
-                Path(p).name
-                for p in _gl.glob("/sys/class/net/virbr*")
-                if not Path(p).name.endswith("-nic")
-            )
-        except Exception:
-            return []
 
     # ── Blocage IPv6 ──────────────────────────────────────────────────────────
 
@@ -81,7 +67,6 @@ class FirewallMixin:
     def _setup_lan_sharing(self) -> bool:
         if self._lan_active:
             return True
-        import ipaddress as _ip
         iface  = self.config.get("lan_iface",   "").strip()
         gw     = self.config.get("lan_gateway", "10.0.0.1").strip()
         subnet = self.config.get("lan_subnet",  "10.0.0.0/24").strip()
@@ -97,7 +82,7 @@ class FirewallMixin:
                 "configuration refusée pour ne pas couper le réseau.", "ERROR")
             return False
         try:
-            net = _ip.ip_network(subnet, strict=False)
+            net = ipaddress.ip_network(subnet, strict=False)
         except ValueError:
             self._log(f"Partage LAN : sous-réseau invalide : {subnet}", "ERROR")
             return False
@@ -134,12 +119,11 @@ class FirewallMixin:
     def _teardown_lan_sharing(self):
         if not self._lan_active:
             return
-        import ipaddress as _ip
         iface  = self.config.get("lan_iface",  "").strip()
         subnet = self.config.get("lan_subnet", "10.0.0.0/24").strip()
         self._stop_lan_dnsmasq()
         try:
-            net = _ip.ip_network(subnet, strict=False)
+            net = ipaddress.ip_network(subnet, strict=False)
         except ValueError:
             net = None
         try:
@@ -162,21 +146,20 @@ class FirewallMixin:
             return
         # Bornes calculées arithmétiquement : ne jamais matérialiser
         # net.hosts() (un /8 représenterait ~16 M d'adresses en mémoire).
-        import ipaddress as _ip
         base = int(net.network_address)
         n    = max(net.num_addresses - 2, 0)   # nb d'hôtes (hors réseau/broadcast)
         if n < 1:
             self._log("Partage LAN : sous-réseau trop petit pour le DHCP.", "WARN")
             return
         if n >= 200:
-            dhcp_start = str(_ip.ip_address(base + 100))
-            dhcp_end   = str(_ip.ip_address(base + 200))
+            dhcp_start = str(ipaddress.ip_address(base + 100))
+            dhcp_end   = str(ipaddress.ip_address(base + 200))
         elif n >= 10:
-            dhcp_start = str(_ip.ip_address(base + 1 + n // 4))
-            dhcp_end   = str(_ip.ip_address(base + 1 + 3 * n // 4))
+            dhcp_start = str(ipaddress.ip_address(base + 1 + n // 4))
+            dhcp_end   = str(ipaddress.ip_address(base + 1 + 3 * n // 4))
         else:
-            dhcp_start = str(_ip.ip_address(base + 1))
-            dhcp_end   = str(_ip.ip_address(base + n))
+            dhcp_start = str(ipaddress.ip_address(base + 1))
+            dhcp_end   = str(ipaddress.ip_address(base + n))
         cmd = [
             "dnsmasq",
             f"--interface={iface}",

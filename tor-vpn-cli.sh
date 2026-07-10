@@ -45,11 +45,9 @@ case "${1:-help}" in
             echo "ERREUR : répertoire d'installation introuvable." >&2
             exit 1
         fi
-        if [ "$EUID" -eq 0 ]; then
-            exec python3 "$DAEMON_DIR/main.py"
-        else
-            exec pkexec env DISPLAY="$DISPLAY" XAUTHORITY="$XAUTHORITY" python3 "$DAEMON_DIR/main.py"
-        fi
+        # Le GUI tourne en utilisateur normal (groupe torvpn) ; les actions
+        # privilégiées (systemctl) passent par pkexec depuis le GUI lui-même.
+        exec python3 "$DAEMON_DIR/main.py"
         ;;
 
     status)
@@ -72,19 +70,47 @@ case "${1:-help}" in
             echo "  Boot auto  : désactivé"
         fi
         echo ""
-        if pgrep -x tor &>/dev/null; then
-            echo "  Tor        : actif  (PID $(pgrep -x tor | head -1))"
+        # État précis via le socket du daemon ; repli sur pgrep si absent.
+        DSTATUS=$(python3 - << 'PYEOF' 2>/dev/null
+import json, socket
+try:
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(1.5)
+    s.connect("/run/tor-vpn-manager.sock")
+    d = json.loads(s.makefile().readline())
+    tor = "actif (bootstrap OK)" if d["tor_ready"] else \
+          ("bootstrap en cours" if d["tor_running"] else "inactif")
+    if d["tunnel_up"]:
+        up = d["tunnel_uptime"]
+        vpn = (f"actif ({d['tunnel_iface']} UP, {d['provider']}, "
+               f"{d['rx_kbs']:.0f} KB/s, depuis {up//3600}h{(up%3600)//60:02d})")
+    else:
+        vpn = "connexion en cours" if d["tor_ready"] else "en attente de Tor"
+    print(f"  Tor        : {tor}")
+    print(f"  VPN        : {vpn}")
+    if d["lan_sharing"]:  print("  Partage LAN: actif")
+    if d["ipv6_blocked"]: print("  IPv6       : bloqué")
+except Exception:
+    pass
+PYEOF
+)
+        if [ -n "$DSTATUS" ]; then
+            echo "$DSTATUS"
         else
-            echo "  Tor        : inactif"
-        fi
-        if pgrep -x openvpn &>/dev/null; then
-            if ip link show tun0 &>/dev/null 2>&1; then
-                echo "  VPN        : actif  (tun0 UP)"
+            if pgrep -x tor &>/dev/null; then
+                echo "  Tor        : actif  (PID $(pgrep -x tor | head -1))"
             else
-                echo "  VPN        : connexion en cours"
+                echo "  Tor        : inactif"
             fi
-        else
-            echo "  VPN        : inactif"
+            if pgrep -x openvpn &>/dev/null; then
+                if ip link show tun0 &>/dev/null 2>&1; then
+                    echo "  VPN        : actif  (tun0 UP)"
+                else
+                    echo "  VPN        : connexion en cours"
+                fi
+            else
+                echo "  VPN        : inactif"
+            fi
         fi
         if [ -f /etc/systemd/resolved.conf.d/tor-vpn-split.conf ]; then
             DNS_SERVER=$(grep '^DNS=' /etc/systemd/resolved.conf.d/tor-vpn-split.conf | cut -d= -f2)

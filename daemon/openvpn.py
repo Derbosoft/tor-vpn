@@ -10,6 +10,7 @@ Corrections critiques appliquées :
 """
 
 import os
+import re
 import subprocess
 import threading
 import time
@@ -95,38 +96,25 @@ class OpenVPNMixin:
         self._log("Failover : tous les fournisseurs et comptes épuisés.", "ERROR")
         return False
 
-    def _dns_script_args(self, cur_conf: str) -> list:
-        """Arguments --up/--down pour configurer le DNS du VPN.
+    _PUSH_DNS_RE = re.compile(r"dhcp-option\s+DNS\s+(\d{1,3}(?:\.\d{1,3}){3})",
+                              re.IGNORECASE)
 
-        OpenVPN n'accepte qu'un seul script up : on n'ajoute le nôtre que si
-        le .ovpn n'en définit pas déjà un.  Le script update-resolv-conf est
-        fourni par les paquets « resolvconf » ou « openvpn-systemd-resolved »
-        (pas par « openvpn » lui-même sur les distributions récentes)."""
-        script = Path("/etc/openvpn/update-resolv-conf")
-        conf_has_updown = False
+    def _check_ovpn_scripts(self, cur_conf: str):
+        """Le DNS du VPN est appliqué nativement par le daemon (resolvectl).
+        On avertit seulement si le .ovpn référence un script up/down absent,
+        ce qui ferait échouer la connexion."""
         try:
-            for ln in Path(cur_conf).read_text(errors="ignore").splitlines():
-                w = ln.strip().split()
-                if w and w[0] in ("up", "down"):
-                    conf_has_updown = True
-                    break
+            text = Path(cur_conf).read_text(errors="ignore")
         except Exception:
-            pass
-        if conf_has_updown:
-            if not script.exists() and f"{script}" in Path(cur_conf).read_text(errors="ignore"):
+            return
+        for ln in text.splitlines():
+            w = ln.strip().split()
+            if len(w) >= 2 and w[0] in ("up", "down") and not Path(w[1]).exists():
                 self._log(
-                    f"Le .ovpn référence {script} qui est absent — la connexion "
-                    "échouera. Installez : sudo apt install resolvconf "
-                    "(ou openvpn-systemd-resolved).", "ERROR")
-            return []          # le .ovpn gère lui-même ses scripts up/down
-        if script.exists():
-            return ["--up", str(script), "--down", str(script)]
-        self._log(
-            "Aucun script DNS : /etc/openvpn/update-resolv-conf absent et le "
-            ".ovpn ne définit pas de script up → DNS du VPN non configuré "
-            "(risque de fuite/panne DNS). Installez : sudo apt install "
-            "resolvconf  (ou openvpn-systemd-resolved).", "WARN")
-        return []
+                    f"Le .ovpn référence un script absent ({w[1]}) — la "
+                    "connexion échouera. Supprimez les lignes up/down : le "
+                    "daemon configure le DNS du VPN lui-même.", "ERROR")
+                return
 
     def _wait_vpn_loop_exit(self, timeout: float = 15.0) -> bool:
         """Attend que la boucle OpenVPN en cours se termine (utilisé avant
@@ -160,7 +148,12 @@ class OpenVPNMixin:
         while not self._stop_vpn and not self._stop_flag:
             result = self._get_active_creds()
             if not result:
-                self._log("Aucun fournisseur/compte disponible.", "ERROR")
+                # Fournisseur courant inutilisable (.ovpn manquant, aucun
+                # compte…) : tenter les suivants avant d'abandonner —
+                # _try_failover renvoie False une fois tout épuisé (borné).
+                if self._try_failover():
+                    continue
+                self._log("Aucun fournisseur/compte utilisable.", "ERROR")
                 break
             cur_conf, username, password, prov_name, acc_idx = result
             self._log(f"Fournisseur : {prov_name}  (compte {acc_idx+1})", "INFO")
@@ -200,11 +193,12 @@ class OpenVPNMixin:
             ]
             cmd += route_args
 
-            cmd += self._dns_script_args(cur_conf)
+            self._check_ovpn_scripts(cur_conf)
 
             self._log(f"OpenVPN : {os.path.basename(cur_conf)} via Tor …")
             tunnel_up = False
-            self._tunnel_up = False
+            self._tunnel_up   = False
+            self._vpn_dns_ips = []
             try:
                 self.openvpn_process = subprocess.Popen(
                     cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -227,6 +221,12 @@ class OpenVPNMixin:
                     elif "net_addr_v4_add" in low:
                         self._protect_tor_routes()
 
+                    # DNS poussés par le serveur (PUSH_REPLY, visible en --verb 3)
+                    elif "push" in low and "dhcp-option" in low:
+                        found = self._PUSH_DNS_RE.findall(line)
+                        if found:
+                            self._vpn_dns_ips.extend(found)
+
                     if "error" in low or "failed" in low:
                         self._log(f"[openvpn] {line}", "ERROR")
                     elif "initialization sequence completed" in low:
@@ -239,8 +239,10 @@ class OpenVPNMixin:
                             self._tunnel_up_time = time.time()
                             self._reconnect_vpn_count = 0
                             self._log("Tunnel VPN actif.", "OK")
-                            # Appliquer le DNS split APRÈS que le script up d'OpenVPN
-                            # ait tourné, pour éviter qu'il écrase notre config.
+                            # DNS du VPN d'abord (resolvectl sur l'interface),
+                            # puis le split DNS (drop-in) qui garde la priorité
+                            # sur les domaines exclus.
+                            self._apply_vpn_dns()
                             self._apply_dns_split()
                             if self.config.get("block_ipv6"):
                                 self._ipv6_block_on()
@@ -253,6 +255,7 @@ class OpenVPNMixin:
                         self._log(f"[openvpn] {line}")
 
                 self._tunnel_up = False
+                self._revert_vpn_dns()
                 self._log("Processus OpenVPN terminé.", "WARN")
 
             except FileNotFoundError:

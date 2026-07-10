@@ -18,6 +18,7 @@ if [[ "${EUID}" -ne 0 ]]; then
 fi
 
 KS6_CHAIN="TORVPN_KS6"
+KS6_FWD_CHAIN="TORVPN_KS6_FWD"
 RESOLVED_DROP_IN="/etc/systemd/resolved.conf.d/tor-vpn-split.conf"
 
 if [[ $INTERNAL -eq 0 ]]; then
@@ -30,16 +31,21 @@ echo "[2/7] Arrêt des processus OpenVPN/Tor restants..."
 pkill -x openvpn 2>/dev/null || true
 pkill -x tor     2>/dev/null || true
 
-echo "[3/7] Nettoyage règles iptables IPv6 (TORVPN_KS6)..."
+echo "[3/7] Nettoyage règles iptables IPv6 (TORVPN_KS6, TORVPN_KS6_FWD)..."
 while ip6tables -D OUTPUT  -j "${KS6_CHAIN}" 2>/dev/null; do :; done
-while ip6tables -D FORWARD -j "${KS6_CHAIN}" 2>/dev/null; do :; done
 ip6tables -F "${KS6_CHAIN}" 2>/dev/null || true
 ip6tables -X "${KS6_CHAIN}" 2>/dev/null || true
+# Le jump FORWARD pointe vers la chaîne _FWD (pas KS6_CHAIN)
+while ip6tables -D FORWARD -j "${KS6_FWD_CHAIN}" 2>/dev/null; do :; done
+ip6tables -F "${KS6_FWD_CHAIN}" 2>/dev/null || true
+ip6tables -X "${KS6_FWD_CHAIN}" 2>/dev/null || true
 
 echo "[4/7] Nettoyage règles iptables LAN (TORVPN_LAN_FWD)..."
 while iptables -D FORWARD -j TORVPN_LAN_FWD 2>/dev/null; do :; done
 iptables -F TORVPN_LAN_FWD 2>/dev/null || true
 iptables -X TORVPN_LAN_FWD 2>/dev/null || true
+# dnsmasq du partage LAN uniquement (jamais « pkill dnsmasq » : libvirt en dépend)
+pkill -f /etc/tor-vpn-manager/tor-vpn-dnsmasq.pid 2>/dev/null || true
 
 echo "[5/7] Nettoyage DNS systemd-resolved..."
 resolvectl revert tun0 2>/dev/null || true
