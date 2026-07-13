@@ -18,4 +18,5 @@ providers/*/
 # Artefacts de travail locaux — jamais dans le dépôt
 .backup-avant-correctif-*/
 merge-ivpn.py
+elaguer-ivpn.py
 .claude/

@@ -311,6 +311,12 @@ class ConfigApp:
         self.config["auto_reconnect"]   = self.auto_reconnect_var.get()
         self.config["block_ipv6"]       = self.block_ipv6_var.get()
         self.config["autostart"]        = self.autostart_var.get()
+        self.config["circuit_check"]    = self.circuit_check_var.get()
+        try:
+            self.config["circuit_min_kbs"]     = int(self.circuit_min_var.get())
+            self.config["circuit_max_retries"] = int(self.circuit_retries_var.get())
+        except ValueError:
+            pass
         self.config["lan_iface"]    = self.lan_iface_var.get().strip()
         self.config["lan_gateway"]  = self.lan_gateway_var.get().strip()
         self.config["lan_subnet"]   = self.lan_subnet_var.get().strip()
@@ -341,6 +347,9 @@ class ConfigApp:
         self.auto_reconnect_var.set(self.config.get("auto_reconnect", True))
         self.block_ipv6_var.set(self.config.get("block_ipv6", False))
         self.autostart_var.set(self.config.get("autostart", False))
+        self.circuit_check_var.set(self.config.get("circuit_check", True))
+        self.circuit_min_var.set(str(self.config.get("circuit_min_kbs", 250)))
+        self.circuit_retries_var.set(str(self.config.get("circuit_max_retries", 3)))
         self.lan_iface_var.set(self.config.get("lan_iface", ""))
         self.lan_gateway_var.set(self.config.get("lan_gateway", "10.0.0.1"))
         self.lan_subnet_var.set(self.config.get("lan_subnet", "10.0.0.0/24"))
@@ -752,6 +761,40 @@ class ConfigApp:
                         text="Reconnexion automatique si la connexion tombe",
                         variable=self.auto_reconnect_var).pack(anchor=tk.W, pady=2)
 
+        cir_frame = self._lf(parent, "Qualité du circuit Tor")
+        self.circuit_check_var = tk.BooleanVar()
+        ttk.Checkbutton(
+            cir_frame,
+            text="Mesurer le débit à la connexion et re-tirer un circuit s'il est lent",
+            variable=self.circuit_check_var).pack(anchor=tk.W, pady=2)
+
+        row_c1 = self._row(cir_frame)
+        ttk.Label(row_c1, text="Débit minimum :", width=22).pack(side=tk.LEFT)
+        self.circuit_min_var = tk.StringVar(value="250")
+        ttk.Spinbox(row_c1, from_=0, to=10000, increment=50, width=7,
+                    textvariable=self.circuit_min_var).pack(side=tk.LEFT, padx=4)
+        self._circuit_hint = tk.Label(row_c1, text="", fg=GRAY, bg=BG,
+                                      font=("Segoe UI", 8))
+        self._circuit_hint.pack(side=tk.LEFT, padx=4)
+        self.circuit_min_var.trace_add(
+            "write", lambda *_: self._update_circuit_hint())
+
+        row_c2 = self._row(cir_frame)
+        ttk.Label(row_c2, text="Essais maximum :", width=22).pack(side=tk.LEFT)
+        self.circuit_retries_var = tk.StringVar(value="3")
+        ttk.Spinbox(row_c2, from_=1, to=10, increment=1, width=7,
+                    textvariable=self.circuit_retries_var).pack(side=tk.LEFT, padx=4)
+        tk.Label(row_c2, text="avant de conserver le circuit tel quel",
+                 fg=GRAY, bg=BG, font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=4)
+
+        tk.Label(cir_frame,
+                 text="Le circuit Tor est tiré au sort à chaque connexion. Une mesure\n"
+                      "unique (2 Mo) juste après l'établissement du tunnel permet de\n"
+                      "re-tirer immédiatement un mauvais circuit. Aucune surveillance\n"
+                      "continue : ce test ne tourne pas en tâche de fond.",
+                 fg=GRAY, bg=BG, font=("Segoe UI", 8), justify=tk.LEFT
+                 ).pack(anchor=tk.W, pady=(4, 0))
+
         sys_frame = self._lf(parent, "Système")
         self.autostart_var = tk.BooleanVar()
         ttk.Checkbutton(sys_frame, text="Lancer le service automatiquement au démarrage",
@@ -770,6 +813,16 @@ class ConfigApp:
                    command=self._run_repair).pack(anchor=tk.W)
 
         self._build_export_import(parent)
+
+    def _update_circuit_hint(self):
+        """Affiche l'équivalent en Mbps du seuil : les speed tests parlent en
+        mégabits, les débits de téléchargement en kilo-octets (1 o = 8 bits)."""
+        try:
+            kbs = int(self.circuit_min_var.get())
+            self._circuit_hint.config(
+                text=f"KB/s   (≈ {kbs * 8 / 1000:.1f} Mbps sur un speed test)")
+        except (ValueError, AttributeError):
+            self._circuit_hint.config(text="KB/s")
 
     def _run_repair(self):
         if not messagebox.askyesno(

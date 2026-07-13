@@ -154,6 +154,9 @@ class WatchdogMixin:
             if self._tunnel_up and guard_tick >= self._GUARD_REFRESH_TICKS:
                 guard_tick = 0
                 self._protect_tor_routes()
+                # Même rythme (~30s) : revérifie que le DNS n'a pas été
+                # effacé par un redémarrage externe de systemd-resolved.
+                self._ensure_dns_config()
 
             conn_tick += 1
             if conn_tick < 3:   # vérifier toutes les 9s (3 × 3s)

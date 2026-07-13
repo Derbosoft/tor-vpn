@@ -1,9 +1,9 @@
-# Tor-VPN Manager — v3.5.0
+# Tor-VPN Manager — v3.6.0
 
 ![Python](https://img.shields.io/badge/Python-3.8+-blue?logo=python)
 ![Platform](https://img.shields.io/badge/Platform-Ubuntu%20%7C%20Debian-orange?logo=linux)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Version](https://img.shields.io/badge/Version-3.5.0-blue)
+![Version](https://img.shields.io/badge/Version-3.6.0-blue)
 ![Systemd](https://img.shields.io/badge/Systemd-service-lightgrey?logo=linux)
 
 > [Documentation en français](README.fr.md)
@@ -227,12 +227,25 @@ CIDRs and IPs that bypass the tunnel and go through the local gateway. The daemo
 - DNS server subnet — **required if split DNS is enabled**
 - NAS, network printers, local servers
 
+> **Directly-connected networks must NOT be excluded — and don't need to be.**
+>
+> Your own NIC's network (e.g. `10.0.50.0/24` on `ens18`) already has a kernel `scope link` route in `/24`, which is more specific than the VPN's `redirect-gateway` (`0.0.0.0/1`): by *longest prefix match* it stays **outside the tunnel anyway**.
+>
+> Excluding it would overlay a `via <gateway>` route with metric 0 that **supersedes the direct route**: all traffic to your own LAN would then detour through the router (*hairpin*), which is often refused — breaking, in particular, access to a VPN server hosted on that same segment.
+>
+> The daemon **detects and skips** such useless exclusions automatically, with a message in the journal.
+
+Also worth excluding: the **subnet of a remote-admin VPN** (WireGuard/OpenVPN you connect through). Without it, replies to your client would be swallowed by the Tor tunnel and **your SSH/RDP session would drop** the moment the service starts.
+
 ### Settings Tab
 
 | Setting | Default | Description |
 |---------|---------|-------------|
 | **Block IPv6** | disabled | DROP ip6tables on OUTPUT + FORWARD |
 | **Auto-reconnect** | enabled | Automatically restarts the tunnel |
+| **Tor circuit quality** | enabled | Measures throughput on connect, re-draws a circuit if too slow |
+| **Minimum throughput** | 250 KB/s | Threshold below which the circuit is re-drawn (≈ 2 Mbps; the Mbps equivalent is shown next to the field) |
+| **Maximum attempts** | 3 | Re-draws allowed before keeping the circuit as-is |
 | **Autostart** | disabled | `systemctl enable/disable tor-vpn-manager` |
 
 **"Repair Network" button:** runs `repair_network.sh` manually — stops the service, clears all iptables rules, routes and DNS blocks, then prompts to restart. Useful when the connection is completely stuck despite a service restart.
@@ -361,6 +374,10 @@ As soon as OpenVPN assigns an IP to the tunnel (`net_addr_v4_add`, visible via `
 **Split DNS timing:**
 VPN DNS is handled natively by the daemon: the servers pushed by the VPN (`PUSH_REPLY`, `dhcp-option DNS`) are parsed from the OpenVPN output and applied to the tunnel interface via `resolvectl` (no `update-resolv-conf` script needed). Split DNS is then applied **after** `Initialization Sequence Completed`; its systemd-resolved drop-in keeps priority for excluded domains.
 
+**DNS robustness:**
+- On startup the daemon checks that `resolvectl` exists and `systemd-resolved` is active — otherwise it warns clearly in the journal (without it, DNS resolution may fail or leak outside Tor).
+- Every ~30 s it **re-verifies** that the tunnel interface's DNS config is still in place. If a third-party tool restarted `systemd-resolved` (which wipes the per-interface *runtime* config), it is **re-applied automatically**. In the normal case this is just a read: no rewrite, no needless `reload`.
+
 **Connection sequence:**
 When `Initialization Sequence Completed` is detected:
 1. Split DNS applied (after OpenVPN's up script)
@@ -442,6 +459,34 @@ If **3 consecutive full restarts** all fail (`_full_restart_count`), the watchdo
 [ERROR] 3 failed restarts — running repair_network.sh …
 [WARN]  Repair done — exiting for systemd relaunch.
 ← systemd automatically relaunches the daemon
+```
+
+### Tor circuit quality check
+
+The Tor circuit is **drawn at random on every connection**, and its quality varies wildly (from ~100 KB/s to several MB/s). Right after the tunnel comes up, the daemon runs **a single measurement** of real throughput (a 2 MB download *through* the tunnel):
+
+```
+Tunnel up → 5 s to settle → measure throughput
+   ├─ ≥ threshold  → circuit kept, no further measurement
+   └─ < threshold  → SIGNAL NEWNYM  (forces a fresh circuit)
+                     → OpenVPN reconnect (same provider/account)
+                     → measure again … up to "maximum attempts"
+                     → beyond that: circuit kept (never loops)
+```
+
+Two design points worth stating:
+
+- **The measurement creates the demand it measures.** Passively reading interface counters would be uninterpretable: low throughput could mean "the link is slow" *or* "nothing is being requested". Here, a low result unambiguously means the circuit is bad.
+- **`NEWNYM` is sent *before* reconnecting.** It does not change the circuit of an already-established connection — it guarantees the *next* connection gets a fresh one. Without it, `MaxCircuitDirtiness` would reuse the same circuit, hence the same slow relays.
+
+**No continuous monitoring**: this test does not run in the background and costs nothing after connection.
+
+Real-world example:
+```
+[WARN] [circuit] Débit faible : 127 KB/s (~1.0 Mbps) < 250 KB/s — nouveau tirage (1/3) …
+[OK  ] [tor] Nouveau circuit demandé (NEWNYM).
+[WARN] Reconnexion sur un circuit Tor neuf …
+[OK  ] [circuit] Débit OK : 568 KB/s (~4.5 Mbps).
 ```
 
 ### Failover logic
@@ -600,6 +645,9 @@ The **Reset** button deletes the torrc file. On the next service start, Tor runs
   "excluded_ips": ["192.168.1.0/24", "10.0.50.0/24"],
   "excluded_domains": [".local"],
   "local_dns": "10.0.50.253",
+  "circuit_check": true,
+  "circuit_min_kbs": 250,
+  "circuit_max_retries": 3,
   "lan_iface": "",
   "lan_gateway": "10.0.0.1",
   "lan_subnet": "10.0.0.0/24",
@@ -617,6 +665,9 @@ The **Reset** button deletes the torrc file. On the next service start, Tor runs
 | `excluded_ips` | list | CIDRs/IPs routed via local gateway |
 | `excluded_domains` | list | Domains routed to local DNS |
 | `local_dns` | string | Local DNS server IP |
+| `circuit_check` | bool | Measure throughput on connect + re-draw if the circuit is slow |
+| `circuit_min_kbs` | int | Threshold in KB/s (250 ≈ 2 Mbps; 0 = disabled) |
+| `circuit_max_retries` | int | Max re-draws before keeping the circuit |
 
 ---
 

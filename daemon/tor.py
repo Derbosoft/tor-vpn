@@ -168,23 +168,27 @@ class TorMixin:
         l'appelant peut alors se replier sur l'inspection des sockets (ss)."""
         ips = set()
         try:
-            resp = self._tor_ctrl("GETINFO orconn-status")
+            resp = self._tor_ctrl("GETINFO orconn-status", timeout=5.0)
             fps = []
             for line in resp.splitlines():
                 line = line.strip().lstrip("250+-").strip()
                 if line.startswith("$") and "CONNECTED" in line:
                     fps.append(line[1:].split("~")[0].split("=")[0].split()[0])
-            for fp in fps[:32]:                      # borne de sécurité
-                ns = self._tor_ctrl(f"GETINFO ns/id/${fp}")
-                # Ligne « r … <IP> <ORPort> <DirPort> » : l'IP est le 3e champ
-                # en partant de la fin — valable pour les deux formats de
-                # consensus (ns : 9 champs avec digest ; microdesc : 8 champs
-                # sans digest, le défaut des clients Tor).
-                for line in ns.splitlines():
-                    w = line.strip().split()
-                    if len(w) >= 8 and w[0] == "r":
-                        ips.add(w[-3])
-                        break
+            if not fps:
+                return ips
+            # Toutes les requêtes en UNE seule connexion authentifiée : ouvrir
+            # un socket + s'authentifier par relais (jusqu'à 32, toutes les
+            # 30 s) surchargeait le ControlPort et provoquait des timeouts.
+            ns = self._tor_ctrl(*[f"GETINFO ns/id/${fp}" for fp in fps[:32]],
+                                timeout=8.0)
+            # Ligne « r … <IP> <ORPort> <DirPort> » : l'IP est le 3e champ en
+            # partant de la fin — valable pour les deux formats de consensus
+            # (ns : 9 champs avec digest ; microdesc : 8 champs sans digest,
+            # le défaut des clients Tor).
+            for line in ns.splitlines():
+                w = line.strip().split()
+                if len(w) >= 8 and w[0] == "r":
+                    ips.add(w[-3])
         except Exception as e:
             self._log(f"[tor-ctrl] relais indisponibles via ControlPort : {e}", "WARN")
         return ips
@@ -204,3 +208,22 @@ class TorMixin:
             self._tor_ready.clear()
         else:
             _run("pkill", "-x", "tor")
+
+    def _new_tor_circuit(self):
+        """Demande à Tor de ne plus réutiliser ses circuits existants.
+
+        NEWNYM ne modifie PAS le circuit d'une connexion déjà établie : il
+        garantit que les PROCHAINES connexions partiront sur un circuit neuf.
+        C'est exactement ce qu'il faut avant de relancer OpenVPN — sans lui,
+        MaxCircuitDirtiness ferait réutiliser le même circuit, donc les mêmes
+        relais lents."""
+        try:
+            resp = self._tor_ctrl("SIGNAL NEWNYM")
+            if "250" in resp:
+                self._log("[tor] Nouveau circuit demandé (NEWNYM).", "OK")
+            else:
+                self._log(
+                    f"[tor] NEWNYM : réponse inattendue ({resp.strip()[:40]})",
+                    "WARN")
+        except Exception as e:
+            self._log(f"[tor] NEWNYM : {e}", "WARN")

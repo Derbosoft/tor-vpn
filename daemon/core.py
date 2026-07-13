@@ -95,6 +95,9 @@ class DaemonCore:
         self._full_restart_count   = 0
         self._inert_ticks          = 0
 
+        self._circuit_attempts = 0      # essais de re-tirage du circuit Tor
+        self._circuit_retry    = False  # reconnexion pour circuit (pas un failover)
+
         self._vpn_dns_ips    = []
 
         self._tun_iface      = "tun0"
@@ -252,6 +255,7 @@ class DaemonCore:
                 "Configurez via :  sudo python3 main.py\n"
                 "Puis relancez :   tor-vpn restart", "ERROR")
             sys.exit(1)
+        self._check_dns_stack()
         self.cleanup_stale_rules()
         self._start_status_server()
         if not self._start_services():

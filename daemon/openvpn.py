@@ -116,6 +116,82 @@ class OpenVPNMixin:
                     "daemon configure le DNS du VPN lui-même.", "ERROR")
                 return
 
+    # ── Contrôle qualité du circuit Tor ──────────────────────────────────────
+
+    _SPEED_URL   = "https://speed.cloudflare.com/__down?bytes={n}"
+    _SPEED_BYTES = 2_000_000
+    _SPEED_WAIT  = 5     # stabilisation du tunnel avant la mesure
+
+    def _measure_tunnel_speed(self, timeout: int = 40) -> float:
+        """Débit descendant mesuré À TRAVERS le tunnel, en KB/s (-1 si échec).
+
+        La mesure crée elle-même la demande qu'elle mesure : contrairement à
+        une lecture passive des compteurs, un résultat faible signifie bien
+        « le lien est lent » et non « rien n'est demandé »."""
+        url = self._SPEED_URL.format(n=self._SPEED_BYTES)
+        try:
+            r = subprocess.run(
+                ["curl", "-s", "-o", "/dev/null", "-w", "%{speed_download}",
+                 "--max-time", str(timeout), url],
+                capture_output=True, text=True, timeout=timeout + 10)
+            bps = float(r.stdout.strip() or 0)
+            return bps / 1024 if bps > 0 else -1.0
+        except Exception:
+            return -1.0
+
+    def _circuit_quality_check(self):
+        """Contrôle qualité UNIQUE, juste après l'établissement du tunnel.
+
+        Le circuit Tor est tiré au sort à la connexion : on vérifie tout de
+        suite si le tirage est bon.  S'il est mauvais, on force un circuit
+        neuf (NEWNYM) puis on relance OpenVPN — seule action qui change
+        réellement les relais.  Borné par circuit_max_retries pour ne jamais
+        boucler : au-delà, on garde le circuit tel quel."""
+        if not self.config.get("circuit_check", True):
+            return
+        min_kbs = self.config.get("circuit_min_kbs", 250)
+        max_try = self.config.get("circuit_max_retries", 3)
+        if min_kbs <= 0:
+            return
+
+        time.sleep(self._SPEED_WAIT)
+        if not self._tunnel_up or self._stop_vpn or self._stop_flag:
+            return
+
+        kbs = self._measure_tunnel_speed()
+        if kbs < 0:
+            self._log("[circuit] Mesure du débit impossible — "
+                      "circuit conservé.", "WARN")
+            return
+        mbps = kbs * 8 / 1000
+
+        if kbs >= min_kbs:
+            self._log(f"[circuit] Débit OK : {kbs:.0f} KB/s "
+                      f"(~{mbps:.1f} Mbps).", "OK")
+            self._circuit_attempts = 0
+            return
+
+        if self._circuit_attempts >= max_try:
+            self._log(
+                f"[circuit] Débit toujours faible ({kbs:.0f} KB/s) après "
+                f"{max_try} essais — circuit conservé (mieux vaut un tunnel "
+                "lent qu'une boucle de reconnexions).", "WARN")
+            return
+
+        self._circuit_attempts += 1
+        self._log(
+            f"[circuit] Débit faible : {kbs:.0f} KB/s (~{mbps:.1f} Mbps) "
+            f"< {min_kbs} KB/s — nouveau tirage de circuit "
+            f"({self._circuit_attempts}/{max_try}) …", "WARN")
+
+        # NEWNYM AVANT la reconnexion : sinon MaxCircuitDirtiness ferait
+        # réutiliser le même circuit, donc les mêmes relais lents.
+        self._new_tor_circuit()
+        self._circuit_retry = True
+        proc = self.openvpn_process
+        if proc and proc.poll() is None:
+            proc.terminate()   # sans _stop_vpn : la boucle reconnecte d'elle-même
+
     def _wait_vpn_loop_exit(self, timeout: float = 15.0) -> bool:
         """Attend que la boucle OpenVPN en cours se termine (utilisé avant
         d'en relancer une — évite deux boucles/processus concurrents)."""
@@ -144,6 +220,8 @@ class OpenVPNMixin:
         self._current_account_idx  = start_account_idx
         self._reconnect_vpn_count  = 0
         self._stop_vpn             = False
+        self._circuit_attempts     = 0
+        self._circuit_retry        = False
 
         while not self._stop_vpn and not self._stop_flag:
             result = self._get_active_creds()
@@ -248,6 +326,12 @@ class OpenVPNMixin:
                                 self._ipv6_block_on()
                             if self.config.get("lan_auto") and self.config.get("lan_iface"):
                                 self._setup_lan_sharing()
+                            # Contrôle qualité du circuit — en thread : la
+                            # mesure ne doit pas bloquer la lecture du flux
+                            # stdout d'OpenVPN.
+                            threading.Thread(
+                                target=self._circuit_quality_check,
+                                daemon=True).start()
                         self._log(f"[openvpn] {line}", "OK")
                     elif "warning" in low:
                         self._log(f"[openvpn] {line}", "WARN")
@@ -274,6 +358,14 @@ class OpenVPNMixin:
             if not self.config.get("auto_reconnect", True):
                 self._ipv6_block_off()
                 break
+
+            # Reconnexion demandée pour re-tirer un circuit Tor : on garde le
+            # MÊME fournisseur/compte (ce n'est pas un échec d'authentification).
+            if self._circuit_retry:
+                self._circuit_retry = False
+                self._log("Reconnexion sur un circuit Tor neuf …", "WARN")
+                time.sleep(2)
+                continue
 
             if self._try_failover():
                 self._log("Failover — reconnexion immédiate …", "WARN")

@@ -1,6 +1,6 @@
 from pathlib import Path
 
-VERSION       = "3.5.0"
+VERSION       = "3.6.0"
 SCRIPT_DIR    = Path(__file__).resolve().parent
 PROVIDERS_DIR = SCRIPT_DIR / "providers"
 CONFIG_DIR    = Path("/etc/tor-vpn-manager")
@@ -18,6 +18,12 @@ DEFAULT_CONFIG = {
     "excluded_ips":      [],
     "excluded_domains":  [],
     "local_dns":         "",
+    # Contrôle qualité du circuit Tor, une seule fois après l'établissement
+    # du tunnel : si le débit mesuré est sous le seuil, on force un circuit
+    # neuf (NEWNYM) et on retente, dans la limite de circuit_max_retries.
+    "circuit_check":      True,
+    "circuit_min_kbs":    250,   # 250 KB/s ≈ 2 Mbps
+    "circuit_max_retries": 3,
     "lan_iface":         "",
     "lan_gateway":       "10.0.0.1",
     "lan_subnet":        "10.0.0.0/24",

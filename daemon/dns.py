@@ -3,12 +3,61 @@ DNS : split DNS via drop-in systemd-resolved, et DNS du VPN appliqué
 nativement par resolvectl (sans dépendre du script update-resolv-conf).
 """
 
+import shutil
 import subprocess
 
-from .core import RESOLVED_DROP_IN
+from .core import _run, RESOLVED_DROP_IN
 
 
 class DNSMixin:
+
+    # ── Contrôle de l'environnement DNS ──────────────────────────────────────
+
+    def _check_dns_stack(self):
+        """Vérifie au démarrage que systemd-resolved est disponible et actif.
+        Sans lui, le DNS du VPN et le split DNS ne peuvent pas s'appliquer :
+        le trafic reste tunnelé, mais les requêtes DNS peuvent échouer ou
+        fuir hors Tor.  On avertit tôt (au lieu d'attendre la 1re connexion)."""
+        if not shutil.which("resolvectl"):
+            self._log(
+                "resolvectl introuvable — systemd-resolved requis pour la "
+                "protection DNS (DNS du VPN + split DNS). Sans lui, la "
+                "résolution DNS peut échouer ou fuir hors Tor. "
+                "Installez systemd-resolved.", "WARN")
+            return
+        if _run("systemctl", "is-active", "systemd-resolved").stdout \
+                .decode().strip() != "active":
+            self._log(
+                "systemd-resolved n'est pas actif — la protection DNS ne "
+                "pourra pas s'appliquer. Lancez : "
+                "systemctl enable --now systemd-resolved.", "WARN")
+
+    def _ensure_dns_config(self):
+        """Réapplique le DNS s'il a disparu (ex. systemd-resolved redémarré
+        par un autre outil).  Appelé périodiquement par le watchdog quand le
+        tunnel est actif.  Léger : en temps normal, une simple lecture ;
+        réapplication uniquement si la config a effectivement été perdue."""
+        if not self._tunnel_up:
+            return
+        # 1. DNS du VPN (config runtime par interface — perdue si resolved
+        #    redémarre, contrairement au drop-in qui est persistant).
+        if self._vpn_dns_ips:
+            try:
+                r = subprocess.run(["resolvectl", "dns", self._tun_iface],
+                                   capture_output=True, text=True, timeout=5)
+                if not any(ip in r.stdout for ip in self._vpn_dns_ips):
+                    self._log("[dns] DNS du VPN absent de l'interface — "
+                              "réapplication.", "WARN")
+                    self._apply_vpn_dns()
+            except Exception:
+                pass
+        # 2. Drop-in split DNS (persistant, mais un autre outil a pu le
+        #    supprimer) : le réécrire s'il devrait exister et manque.
+        if (self.config.get("local_dns", "").strip()
+                and self.config.get("excluded_domains")
+                and not RESOLVED_DROP_IN.exists()):
+            self._log("[dns] Drop-in split DNS disparu — réapplication.", "WARN")
+            self._apply_dns_split()
 
     # ── DNS du VPN (poussé par le serveur, appliqué via resolvectl) ──────────
 

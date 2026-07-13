@@ -28,14 +28,49 @@ class NetworkMixin:
         except OSError:
             return False
 
+    def _connected_networks(self) -> list:
+        """Réseaux directement connectés (routes kernel « scope link »)."""
+        nets = []
+        try:
+            r = _run("ip", "-4", "route", "show", "scope", "link")
+            for line in r.stdout.decode().splitlines():
+                parts = line.split()
+                if parts and "/" in parts[0]:
+                    try:
+                        nets.append(ipaddress.ip_network(parts[0], strict=False))
+                    except ValueError:
+                        pass
+        except Exception:
+            pass
+        return nets
+
     def _build_route_args(self) -> list:
         args = []
+        connected = self._connected_networks()
         for entry in self.config.get("excluded_ips", []):
             try:
                 net = ipaddress.ip_network(entry, strict=False)
-                args += ["--route", str(net.network_address), str(net.netmask), "net_gateway"]
             except ValueError:
                 self._log(f"Route ignorée (invalide) : {entry}", "WARN")
+                continue
+            # Un réseau directement connecté ne doit JAMAIS être routé via
+            # net_gateway : sa route kernel (scope link, /24 par ex.) prime
+            # déjà sur redirect-gateway (0.0.0.0/1) par longest-prefix-match,
+            # donc il est de toute façon hors tunnel.  L'exclure superpose une
+            # route « via <gw> » de métrique 0 qui SUPPLANTE la route directe :
+            # tout le LAN part alors en détour par le routeur (hairpin), ce qui
+            # casse l'accès aux machines du même segment — typiquement un
+            # serveur VPN d'accès distant hébergé sur ce LAN.
+            if any(net.version == c.version and net.subnet_of(c)
+                   for c in connected):
+                self._log(
+                    f"Exclusion ignorée ({entry}) : réseau directement "
+                    "connecté, déjà hors tunnel via sa route locale. "
+                    "L'exclure casserait l'accès aux machines de ce LAN.",
+                    "INFO")
+                continue
+            args += ["--route", str(net.network_address),
+                     str(net.netmask), "net_gateway"]
         return args
 
     def _add_protected_routes(self, ips, source: str):
