@@ -529,6 +529,8 @@ When LAN sharing is enabled:
 
 If the tunnel drops, LAN traffic is blocked — no leak through the direct connection.
 
+The rules in steps 3 and 4 hard-code the **tunnel interface name**. Since the `.ovpn` files use `dev tun` (first free device), that name can change when the tunnel is rebuilt. Since v3.6.1 the daemon compares the remembered interface against the current one and **rebuilds the rules** when they differ (logging a `WARN`): without this they pointed at nothing and LAN traffic fell through to the final `DROP` rule — a total, silent outage until the service was restarted.
+
 ---
 
 ## Split DNS — Local Domains

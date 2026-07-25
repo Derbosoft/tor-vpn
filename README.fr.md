@@ -528,6 +528,8 @@ Quand le partage LAN est activé :
 
 Si le tunnel tombe, le trafic LAN est bloqué — aucune fuite par la connexion directe.
 
+Les règles des étapes 3 et 4 figent le **nom de l'interface tunnel**. Comme les `.ovpn` utilisent `dev tun` (premier device libre), ce nom peut changer au remontage du tunnel. Depuis la v3.6.1, le daemon compare l'interface mémorisée à l'interface courante et **reconstruit les règles** si elles diffèrent (avec une trace en `WARN`) : sans cela, elles pointaient dans le vide et le trafic LAN tombait sur la règle `DROP` finale — coupure totale et silencieuse jusqu'au redémarrage du service.
+
 ---
 
 ## DNS split — Domaines locaux

@@ -83,6 +83,7 @@ class DaemonCore:
         self._stop_tor_flag      = False
         self._ipv6_blocked       = False
         self._lan_active         = False
+        self._lan_tun            = ""    # interface tunnel figée dans les règles LAN
         self._dnsmasq_proc       = None
 
         self._current_provider_idx = 0

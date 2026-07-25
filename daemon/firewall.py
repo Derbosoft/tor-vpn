@@ -65,8 +65,21 @@ class FirewallMixin:
     # ── Partage LAN ───────────────────────────────────────────────────────────
 
     def _setup_lan_sharing(self) -> bool:
+        # Les règles figent le nom de l'interface tunnel (MASQUERADE -o tun,
+        # RETURN -o tun).  Après un remontage du tunnel — redémarrage complet
+        # du watchdog ou simple reconnexion OpenVPN — ce nom peut changer
+        # (« dev tun » choisit le premier device libre).  Sortir en avance
+        # laisserait alors des règles pointant dans le vide : le RETURN ne
+        # correspond plus, le trafic LAN tombe sur le DROP final et les
+        # clients perdent tout accès, en silence.  On reconstruit donc.
         if self._lan_active:
-            return True
+            if self._lan_tun == self._tun_iface:
+                return True
+            self._log(
+                f"Partage LAN : interface tunnel changée "
+                f"({self._lan_tun or '?'} → {self._tun_iface}) — "
+                "reconstruction des règles.", "WARN")
+            self._teardown_lan_sharing()
         iface  = self.config.get("lan_iface",   "").strip()
         gw     = self.config.get("lan_gateway", "10.0.0.1").strip()
         subnet = self.config.get("lan_subnet",  "10.0.0.0/24").strip()
@@ -108,6 +121,7 @@ class FirewallMixin:
             _run("iptables", "-A", KS_LAN_CHAIN, "-i", iface, "-j", "DROP")
             _run("iptables", "-I", "FORWARD", "-j", KS_LAN_CHAIN)
             self._lan_active = True
+            self._lan_tun    = tun   # mémorisé pour le démontage et la détection
             self._log(f"Partage LAN actif : {iface} ({gw}/{net.prefixlen}) → {tun}.", "OK")
             if self.config.get("lan_dhcp", True):
                 self._start_lan_dnsmasq(iface, gw, net)
@@ -131,11 +145,16 @@ class FirewallMixin:
             _run("iptables", "-F", KS_LAN_CHAIN)
             _run("iptables", "-X", KS_LAN_CHAIN)
             if net:
+                # Supprimer avec l'interface RÉELLEMENT utilisée à la création,
+                # pas avec _tun_iface : s'il a changé depuis, on effacerait une
+                # règle inexistante en laissant la vraie orpheline dans le NAT.
                 _run("iptables", "-t", "nat", "-D", "POSTROUTING",
-                     "-s", str(net), "-o", self._tun_iface, "-j", "MASQUERADE")
+                     "-s", str(net), "-o", self._lan_tun or self._tun_iface,
+                     "-j", "MASQUERADE")
             if iface:
                 _run("ip", "addr", "flush", "dev", iface)
             self._lan_active = False
+            self._lan_tun    = ""
             self._log("Partage LAN désactivé.", "OK")
         except Exception as e:
             self._log(f"Partage LAN (désactivation) : {e}", "ERROR")
