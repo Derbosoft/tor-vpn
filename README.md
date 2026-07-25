@@ -202,7 +202,7 @@ Manages VPN providers and their accounts. List order defines connection and fail
 - Stored as base64 in `config.json` (simple obfuscation, see [Security](#security))
 - ↑ ↓ buttons to reorder; the daemon tries accounts in order
 
-**Automatic failover:** if one account fails, the daemon moves to the next account of the same provider, then to the next provider.
+**Automatic failover:** if an account's credentials are refused, the daemon moves to the next account of the same provider. On a network drop it retries the same account before switching provider — see [Failover & Watchdog](#failover--watchdog).
 
 **Import / Export `.tvpn`:** ZIP archive containing `config.json` + all `.ovpn` files. Transfers the complete configuration between machines.
 
@@ -427,6 +427,23 @@ NAT POSTROUTING: MASQUERADE source=<lan_subnet> out=tunX
 ---
 
 ## Failover & Watchdog
+
+### Reconnection: two causes, two responses
+
+When the OpenVPN process exits, the daemon determines **the nature of the failure** before deciding (v3.6.1 behaviour):
+
+| Detected cause | Response | Delay |
+|----------------|----------|-------|
+| **Credentials refused** (`AUTH_FAILED` or `SIGTERM[soft,auth-failure]`) | Next account of the same provider | 3 s |
+| **Everything else** (network drop, TLS timeout, `ping-exit`) | **Same account**, up to `RECONNECT_MAX` (5) times | 15 s |
+| Same account fails 5 times in a row | **Next provider**, account 1 | 3 s |
+| No fallback provider left | Give up → anti-inertia net → systemd relaunch | — |
+
+The key point: **switching accounts only helps when the account is at fault.** All accounts of a provider share the same `.ovpn` file, hence the same server list — switching has no effect on a network outage or a server-side problem. Only switching *provider* does.
+
+> **Before v3.6.1**, any disconnect triggered an account failover. A plain network drop burned through all ten iVPN accounts then ProtonVPN's in about thirty seconds (3 s apart), without the 15 s backoff ever coming into play: up to 65 rapid-fire authentication attempts during a sustained outage. The current logic makes 12, spaced 15 s apart — gentler on the provider, and far more likely to succeed since a network drop resolves on its own.
+
+A fault affecting an entire provider (`.ovpn` not found) likewise skips straight to the next provider, without walking its accounts one by one.
 
 ### Failure detection
 

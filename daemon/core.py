@@ -99,6 +99,7 @@ class DaemonCore:
 
         self._circuit_attempts = 0      # essais de re-tirage du circuit Tor
         self._circuit_retry    = False  # reconnexion pour circuit (pas un failover)
+        self._auth_failed      = False  # dernière rupture = refus d'identifiants
 
         self._vpn_dns_ips    = []
 

@@ -202,7 +202,7 @@ Gère la liste des fournisseurs VPN et leurs comptes. L'ordre de la liste défin
 - Stockés en base64 dans `config.json` (obfuscation simple, voir [Sécurité](#sécurité))
 - Boutons ↑ ↓ pour réordonner ; le daemon tente les comptes dans l'ordre
 
-**Failover automatique :** si un compte échoue, le daemon passe au compte suivant du même fournisseur, puis au fournisseur suivant.
+**Failover automatique :** si les identifiants d'un compte sont refusés, le daemon passe au compte suivant du même fournisseur. Sur une coupure réseau, il réessaie le même compte avant de changer de fournisseur — voir [Failover et watchdog](#failover-et-watchdog).
 
 **Import / Export `.tvpn` :** archive ZIP contenant `config.json` + tous les fichiers `.ovpn`. Permet de transférer la configuration complète entre machines.
 
@@ -426,6 +426,23 @@ NAT POSTROUTING : MASQUERADE source=<subnet_lan> out=tunX
 ---
 
 ## Failover et watchdog
+
+### Reconnexion : deux causes, deux réponses
+
+Quand le processus OpenVPN se termine, le daemon distingue **la nature de la rupture** avant de décider (comportement de la v3.6.1) :
+
+| Cause détectée | Réponse | Délai |
+|----------------|---------|-------|
+| **Identifiants refusés** (`AUTH_FAILED` ou `SIGTERM[soft,auth-failure]`) | Compte suivant du même fournisseur | 3 s |
+| **Tout le reste** (coupure réseau, TLS expiré, `ping-exit`) | **Même compte**, jusqu'à `RECONNECT_MAX` (5) fois | 15 s |
+| Le même compte échoue 5 fois de suite | **Fournisseur suivant**, compte 1 | 3 s |
+| Plus aucun fournisseur de secours | Abandon → filet anti-inertie → relance systemd | — |
+
+Le point clé : **changer de compte ne sert que si le compte est en cause.** Tous les comptes d'un fournisseur partagent le même fichier `.ovpn`, donc la même liste de serveurs — en changer n'a aucun effet sur une panne réseau ou côté serveur. Seul le changement de *fournisseur* en a.
+
+> **Avant la v3.6.1**, toute rupture déclenchait un failover de compte. Une simple coupure réseau brûlait les dix comptes iVPN puis ceux de ProtonVPN en une trentaine de secondes (3 s d'écart), sans que la temporisation de 15 s n'entre jamais en jeu : jusqu'à 65 tentatives d'authentification en rafale sur une panne prolongée. La logique actuelle en fait 12, espacées de 15 s — moins agressif pour le fournisseur, et bien plus susceptible de réussir puisqu'une coupure réseau se répare d'elle-même.
+
+Un défaut qui touche le fournisseur entier (`.ovpn` introuvable) fait aussi passer directement au fournisseur suivant, sans parcourir ses comptes un à un.
 
 ### Détection de panne
 

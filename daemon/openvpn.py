@@ -96,6 +96,22 @@ class OpenVPNMixin:
         self._log("Failover : tous les fournisseurs et comptes épuisés.", "ERROR")
         return False
 
+    def _try_next_provider(self) -> bool:
+        """Passe au fournisseur suivant, sur son premier compte.
+
+        À la différence de _try_failover, ne parcourt PAS les comptes restants
+        du fournisseur courant : tous partagent le même fichier .ovpn, donc la
+        même liste de serveurs.  En changer n'a aucun effet sur une panne côté
+        serveur — seul le changement de fournisseur en a."""
+        providers = self.config.get("providers", [])
+        if self._current_provider_idx + 1 >= len(providers):
+            return False
+        self._current_provider_idx += 1
+        self._current_account_idx   = 0
+        self._log(f"Fournisseur suivant : "
+                  f"{providers[self._current_provider_idx]['name']}", "WARN")
+        return True
+
     _PUSH_DNS_RE = re.compile(r"dhcp-option\s+DNS\s+(\d{1,3}(?:\.\d{1,3}){3})",
                               re.IGNORECASE)
 
@@ -261,10 +277,10 @@ class OpenVPNMixin:
         while not self._stop_vpn and not self._stop_flag:
             result = self._get_active_creds()
             if not result:
-                # Fournisseur courant inutilisable (.ovpn manquant, aucun
-                # compte…) : tenter les suivants avant d'abandonner —
-                # _try_failover renvoie False une fois tout épuisé (borné).
-                if self._try_failover():
+                # Fournisseur inutilisable (.ovpn manquant, aucun compte) : le
+                # défaut touche le fournisseur entier, pas un compte — inutile
+                # de parcourir ses autres comptes, on passe au suivant.
+                if self._try_next_provider():
                     continue
                 self._log("Aucun fournisseur/compte utilisable.", "ERROR")
                 break
@@ -326,6 +342,7 @@ class OpenVPNMixin:
             self._log(f"OpenVPN : {os.path.basename(cur_conf)} via Tor …")
             tunnel_up = False
             self._tunnel_up   = False
+            self._auth_failed = False
             self._vpn_dns_ips = []
             try:
                 self.openvpn_process = subprocess.Popen(
@@ -354,6 +371,15 @@ class OpenVPNMixin:
                         found = self._PUSH_DNS_RE.findall(line)
                         if found:
                             self._vpn_dns_ips.extend(found)
+
+                    # Refus des identifiants par le serveur.  Deux signatures
+                    # indépendantes, toutes deux observées en production :
+                    #   « AUTH: Received control message: AUTH_FAILED »
+                    #   « SIGTERM[soft,auth-failure] received, process exiting »
+                    # Mémorisé pour que la boucle bascule de compte, au lieu
+                    # de s'acharner sur un compte que le serveur refuse.
+                    if "auth_failed" in low or "auth-failure" in low:
+                        self._auth_failed = True
 
                     if "error" in low or "failed" in low:
                         self._log(f"[openvpn] {line}", "ERROR")
@@ -417,19 +443,51 @@ class OpenVPNMixin:
                 time.sleep(2)
                 continue
 
-            if self._try_failover():
-                self._log("Failover — reconnexion immédiate …", "WARN")
-                time.sleep(3)
-                continue
+            # ── Décision de reconnexion ──────────────────────────────────────
+            # Deux causes de rupture, deux réponses différentes.
+            #
+            # 1. Le serveur a REFUSÉ les identifiants : le compte est en cause
+            #    (mot de passe invalide, quota de connexions simultanées
+            #    atteint).  Changer de compte est la bonne réponse, et tout de
+            #    suite — s'acharner ne servirait à rien.
+            #
+            # 2. Tout le reste (coupure réseau, TLS qui expire, ping-exit) : le
+            #    compte n'y est pour rien.  En changer ne changerait d'ailleurs
+            #    RIEN au problème, puisque tous les comptes d'un fournisseur
+            #    partagent le même .ovpn, donc les mêmes serveurs.  On réessaie
+            #    le même compte, après temporisation.  Ce n'est qu'après
+            #    RECONNECT_MAX échecs consécutifs qu'on change de fournisseur —
+            #    le seul changement qui touche réellement au serveur.
+            #
+            # Auparavant, toute rupture déclenchait un failover : les dix
+            # comptes iVPN puis ceux de Proton étaient brûlés en une trentaine
+            # de secondes, sans que la temporisation n'entre jamais en jeu.
+            if self._auth_failed:
+                self._auth_failed = False
+                if self._try_failover():
+                    self._log("Identifiants refusés — compte suivant, "
+                              "reconnexion immédiate …", "WARN")
+                    time.sleep(3)
+                    continue
+                self._log("Identifiants refusés sur tous les comptes de tous "
+                          "les fournisseurs.", "ERROR")
+                break
 
             self._reconnect_vpn_count += 1
             if self._reconnect_vpn_count > RECONNECT_MAX:
+                # Le compte courant ne repart pas après plusieurs essais
+                # espacés : la panne est probablement côté serveur.
+                if self._try_next_provider():
+                    self._reconnect_vpn_count = 0
+                    time.sleep(3)
+                    continue
                 self._log(
-                    f"OpenVPN : {RECONNECT_MAX} tentatives échouées, abandon.", "ERROR")
+                    f"OpenVPN : {RECONNECT_MAX} tentatives échouées et plus "
+                    "aucun fournisseur de secours, abandon.", "ERROR")
                 break
 
             self._log(
-                f"OpenVPN : reconnexion dans {RECONNECT_DELAY}s "
+                f"OpenVPN : reconnexion du même compte dans {RECONNECT_DELAY}s "
                 f"({self._reconnect_vpn_count}/{RECONNECT_MAX}) …", "WARN")
             for _ in range(RECONNECT_DELAY):
                 if self._stop_flag or self._stop_vpn:
