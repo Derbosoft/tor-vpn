@@ -382,6 +382,8 @@ Le DNS du VPN est géré nativement par le daemon : les serveurs poussés par le
 - Au démarrage, le daemon vérifie que `resolvectl` est présent et que `systemd-resolved` est actif — sinon il avertit clairement dans le journal (sans lui, la résolution DNS peut échouer ou fuir hors Tor).
 - Toutes les ~30 s, il **revérifie** que la configuration DNS de l'interface tunnel est toujours en place. Si un outil tiers a redémarré `systemd-resolved` (ce qui efface la config *runtime* par interface), elle est **réappliquée automatiquement**. En temps normal c'est une simple lecture : aucune réécriture, aucun `reload` inutile.
 
+  Depuis la v3.6.1, le contrôle porte sur les **trois** attributs posés (serveurs DNS, domaine `~.`, `default-route`) et non plus sur les seuls serveurs. Motif : lors d'une reconnexion interne (`SIGUSR1`), le hook natif `dns-updown` d'OpenVPN 2.6+ réinstalle les serveurs mais pas nécessairement le reste — et sans `~.`, l'interface tunnel cesse d'être la destination DNS par défaut, si bien que les requêtes publiques peuvent repartir vers le DNS local, hors tunnel, sans que rien ne le signale.
+
 **Séquence à la connexion :**
 Quand `Initialization Sequence Completed` est détecté :
 1. DNS split appliqué (après le script up d'OpenVPN)

@@ -287,6 +287,18 @@ class OpenVPNMixin:
             self._orig_gw, self._orig_iface = self._get_default_gateway()
             if self._orig_gw:
                 self._log(f"Passerelle : {self._orig_gw} via {self._orig_iface}")
+            else:
+                # Sans passerelle, _protect_tor_routes() ne peut rien faire et
+                # sortait en silence : Tor tente alors de joindre ses relais
+                # par le tunnel qui dépend d'eux — boucle de routage, tunnel
+                # qui tombe, et aucune trace de la cause.  Cas typique : une
+                # route par défaut point-à-point (« default dev ppp0 »), sans
+                # « via », que _get_default_gateway ne sait pas lire.
+                self._log(
+                    "Passerelle par défaut introuvable — la protection des "
+                    "routes /32 des guards Tor est DÉSACTIVÉE : risque de "
+                    "boucle de routage. Vérifiez « ip route show default » "
+                    "(une route sans « via » n'est pas reconnue).", "ERROR")
 
             self._write_auth_tmp(username, password)
 

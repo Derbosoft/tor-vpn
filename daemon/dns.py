@@ -32,6 +32,21 @@ class DNSMixin:
                 "pourra pas s'appliquer. Lancez : "
                 "systemctl enable --now systemd-resolved.", "WARN")
 
+    @staticmethod
+    def _resolvectl_link_status(iface: str) -> dict:
+        """État DNS d'une interface sous forme d'étiquettes → valeurs.
+
+        « resolvectl status <iface> » expose serveurs, domaines et
+        default-route en UN seul appel — inutile d'en faire trois."""
+        r = subprocess.run(["resolvectl", "status", iface],
+                           capture_output=True, text=True, timeout=5)
+        info = {}
+        for ln in r.stdout.splitlines():
+            label, sep, val = ln.partition(":")
+            if sep:
+                info[label.strip()] = val.strip()
+        return info
+
     def _ensure_dns_config(self):
         """Réapplique le DNS s'il a disparu (ex. systemd-resolved redémarré
         par un autre outil).  Appelé périodiquement par le watchdog quand le
@@ -41,16 +56,34 @@ class DNSMixin:
             return
         # 1. DNS du VPN (config runtime par interface — perdue si resolved
         #    redémarre, contrairement au drop-in qui est persistant).
+        #
+        #    On contrôle les TROIS attributs posés par _apply_vpn_dns : le
+        #    serveur seul ne suffit pas.  Le hook natif dns-updown d'OpenVPN
+        #    2.6+ réinstalle le serveur à chaque reconnexion interne
+        #    (SIGUSR1), mais pas forcément « ~. » ni le default-route.  Sans
+        #    eux, l'interface tunnel cesse d'être la destination DNS par
+        #    défaut et les requêtes publiques peuvent repartir vers le DNS
+        #    local — hors tunnel, et sans que rien ne le signale.
         if self._vpn_dns_ips:
+            missing = []
             try:
-                r = subprocess.run(["resolvectl", "dns", self._tun_iface],
-                                   capture_output=True, text=True, timeout=5)
-                if not any(ip in r.stdout for ip in self._vpn_dns_ips):
-                    self._log("[dns] DNS du VPN absent de l'interface — "
-                              "réapplication.", "WARN")
-                    self._apply_vpn_dns()
+                st = self._resolvectl_link_status(self._tun_iface)
             except Exception:
-                pass
+                st = {}
+            if st:   # vide = lecture impossible : ne rien conclure
+                if not any(ip in st.get("DNS Servers", "")
+                           for ip in self._vpn_dns_ips):
+                    missing.append("serveur")
+                if "~." not in st.get("DNS Domain", "").split():
+                    missing.append("domaine ~.")
+                if st.get("Default Route", "") != "yes":
+                    missing.append("default-route")
+            if missing:
+                self._log(
+                    f"[dns] Config DNS du VPN incomplète sur "
+                    f"{self._tun_iface} ({', '.join(missing)}) — "
+                    "réapplication.", "WARN")
+                self._apply_vpn_dns()
         # 2. Drop-in split DNS (persistant, mais un autre outil a pu le
         #    supprimer) : le réécrire s'il devrait exister et manque.
         if (self.config.get("local_dns", "").strip()
