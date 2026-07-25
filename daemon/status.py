@@ -54,6 +54,7 @@ class StatusMixin:
 
     def _start_status_server(self):
         """Démarre le serveur de statut sur le socket Unix (thread daemon)."""
+        srv = None
         try:
             STATUS_SOCKET.unlink(missing_ok=True)
             srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -61,6 +62,8 @@ class StatusMixin:
             os.chmod(STATUS_SOCKET, 0o666)   # lecture seule, aucune donnée sensible
             srv.listen(4)
         except Exception as e:
+            if srv is not None:
+                srv.close()                  # sinon le descripteur reste ouvert
             self._log(f"Socket de statut indisponible ({e}) — "
                       "état exposé via journalctl uniquement.", "WARN")
             return

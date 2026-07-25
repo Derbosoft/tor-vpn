@@ -28,9 +28,10 @@ Route **all your network traffic through OpenVPN tunneled inside Tor** on Ubuntu
 12. [Tor Configuration (torrc)](#tor-configuration-torrc)
 13. [Automatic Network Repair](#automatic-network-repair)
 14. [config.json Format](#configjson-format)
-15. [Security](#security)
-16. [Getting Started](#getting-started)
-17. [Uninstallation](#uninstallation)
+15. [Tests](#tests)
+16. [Security](#security)
+17. [Getting Started](#getting-started)
+18. [Uninstallation](#uninstallation)
 
 ---
 
@@ -137,6 +138,7 @@ tor-vpn-manager/
 ├── install.sh           Ubuntu/Debian installation script
 ├── repair_network.sh    Network repair script (iptables, routes, DNS cleanup)
 ├── tor-vpn-cli.sh       CLI source — copied to /usr/local/bin/tor-vpn by install.sh
+├── run-tests.sh         Test-suite runner (+ network fingerprint before/after)
 ├── template.ovpn        Annotated template to create a compatible .ovpn file
 │
 ├── daemon/              Daemon package (launched by systemd via python3 -m daemon)
@@ -698,6 +700,35 @@ The **Reset** button deletes the torrc file. On the next service start, Tor runs
 | `circuit_check` | bool | Measure throughput on connect + re-draw if the circuit is slow |
 | `circuit_min_kbs` | int | Threshold in KB/s (250 ≈ 2 Mbps; 0 = disabled) |
 | `circuit_max_retries` | int | Max re-draws before keeping the circuit |
+
+---
+
+## Tests
+
+The project is covered by a suite of **285 tests** (`unittest`, no external dependency):
+
+```bash
+bash run-tests.sh                      # everything
+bash run-tests.sh -v                   # test by test
+bash run-tests.sh tests.test_openvpn   # one module
+```
+
+**The suite never touches the system.** `iptables`, `ip`, `resolvectl`, `systemctl`, `curl`, `openvpn` and `tor` are intercepted and recorded instead of executed: the tests assert *which commands would have been run*, with which arguments and in which order. The suite is therefore safe to run on the production machine with the tunnel up. `run-tests.sh` takes a network fingerprint before and after to prove it, and `tests/test_safety.py` prevents a future test from bypassing that rule.
+
+What is covered, beyond the happy paths:
+
+| Area | Example cases |
+|------|---------------|
+| Excluded routes | IPv6 rejected, directly-connected network skipped (scope-link trap), CIDR normalisation |
+| ControlPort | microdesc (8-field) *and* ns (9-field) consensus, single connection for N queries, 32-relay cap |
+| DNS | servers / `~.` domain / default-route checked separately, abstain when state is unreadable |
+| Firewall | `DROP` always the last rule, refusal to flush the uplink, rebuild when the tunnel is renamed |
+| Circuit quality | exact threshold, retry cap, stale thread must not kill the next tunnel |
+| Reconnection | credentials refused vs network drop, bounded attempt count |
+| Security | `auth.tmp` 0600 even under a permissive umask, no credentials in the status socket, import path-traversal guard |
+| Consistency | version identical in `constants.py` and both READMEs, `--script-security` absent from the code |
+
+Several tests also exercise the system **read-only** to validate parsers against reality rather than a frozen sample (`/proc/net/dev` layout, `resolvectl status` output).
 
 ---
 

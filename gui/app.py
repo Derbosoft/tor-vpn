@@ -9,6 +9,7 @@ les actions systemctl privilégiées passent par pkexec)
 """
 
 import base64
+import copy
 import ipaddress
 import json
 import os
@@ -57,11 +58,18 @@ class ConfigApp:
     # ── Config ────────────────────────────────────────────────────────────────
 
     def _load_config(self) -> dict:
+        # deepcopy et non dict() : les défauts contiennent des listes, et le
+        # GUI les modifie EN PLACE (_add_provider fait providers.append).  Une
+        # copie superficielle ferait grossir DEFAULT_CONFIG lui-même.
+        defaults = copy.deepcopy(DEFAULT_CONFIG)
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         if CONFIG_FILE.exists():
             try:
                 with open(CONFIG_FILE) as f:
-                    return {**DEFAULT_CONFIG, **json.load(f)}
+                    loaded = json.load(f)
+                if not isinstance(loaded, dict):
+                    raise ValueError("config.json ne contient pas un objet JSON")
+                return {**defaults, **loaded}
             except Exception as e:
                 # Ne pas écraser silencieusement une config corrompue :
                 # on la met de côté pour pouvoir la récupérer.
@@ -72,7 +80,7 @@ class ConfigApp:
                           file=sys.stderr)
                 except Exception:
                     pass
-        return dict(DEFAULT_CONFIG)
+        return defaults
 
     def _save_config(self):
         try:
@@ -927,7 +935,7 @@ class ConfigApp:
                             dest_dir = PROVIDERS_DIR / parts[1]
                             dest_dir.mkdir(parents=True, exist_ok=True)
                             (dest_dir / parts[2]).write_bytes(zf.read(name))
-                self.config = {**DEFAULT_CONFIG, **new_cfg}
+                self.config = {**copy.deepcopy(DEFAULT_CONFIG), **new_cfg}
                 self._save_config()
                 self.ip_list.delete(0, tk.END)
                 self.domain_list.delete(0, tk.END)

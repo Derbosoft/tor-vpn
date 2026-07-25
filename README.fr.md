@@ -28,9 +28,10 @@ Daemon + interface graphique pour router **tout le trafic réseau via OpenVPN tu
 12. [Configuration Tor (torrc)](#configuration-tor-torrc)
 13. [Réparation réseau automatique](#réparation-réseau-automatique)
 14. [Format config.json](#format-configjson)
-15. [Sécurité](#sécurité)
-16. [Premiers pas](#premiers-pas)
-17. [Désinstallation](#désinstallation)
+15. [Tests](#tests)
+16. [Sécurité](#sécurité)
+17. [Premiers pas](#premiers-pas)
+18. [Désinstallation](#désinstallation)
 
 ---
 
@@ -138,6 +139,7 @@ tor-vpn-manager/
 ├── repair_network.sh    Script de réparation réseau (nettoyage iptables, routes, DNS)
 ├── tor-vpn-cli.sh       Source du CLI — copié dans /usr/local/bin/tor-vpn par install.sh
 ├── template.ovpn        Modèle commenté pour créer un fichier .ovpn compatible
+├── run-tests.sh         Lanceur de la suite de tests (+ empreinte réseau avant/après)
 │
 ├── daemon/              Package daemon (lancé par systemd via python3 -m daemon)
 │   ├── __init__.py      Classe Daemon (agrège tous les mixins) + fonction main()
@@ -153,6 +155,20 @@ tor-vpn-manager/
 ├── gui/                 Package interface graphique
 │   ├── __init__.py
 │   └── app.py           ConfigApp — interface tkinter complète (6 onglets)
+│
+├── tests/               Suite de tests (unittest, aucune dépendance externe)
+│   ├── helpers.py       Daemon factice + interception des commandes système
+│   ├── test_network.py      routes exclues, passerelle, protection des guards
+│   ├── test_tor.py          parsing ControlPort, bootstrap, NEWNYM
+│   ├── test_dns.py          DNS du VPN, split DNS, revérification périodique
+│   ├── test_firewall.py     blocage IPv6, partage LAN, plage DHCP
+│   ├── test_openvpn.py      identifiants, qualité de circuit, reconnexion
+│   ├── test_watchdog.py     connectivité, filet anti-inertie, redémarrage
+│   ├── test_config_status.py  chargement de config, socket de statut
+│   ├── test_core_lifecycle.py ControlPort réel, nettoyage, arrêt propre
+│   ├── test_gui.py          validation des saisies, torrc, obfuscation
+│   ├── test_scripts.py      syntaxe shell, unité systemd, cohérence des versions
+│   └── test_safety.py       garde-fou : la suite ne touche pas au système
 │
 └── providers/           Dossier des fichiers .ovpn par fournisseur (non versionné)
     └── <NomFournisseur>/
@@ -697,6 +713,35 @@ Le bouton **Réinitialiser** supprime le fichier torrc. Au prochain démarrage d
 | `circuit_check` | bool | Mesure du débit à la connexion + re-tirage si circuit lent |
 | `circuit_min_kbs` | int | Seuil en KB/s (250 ≈ 2 Mbps ; 0 = désactivé) |
 | `circuit_max_retries` | int | Re-tirages max avant de conserver le circuit |
+
+---
+
+## Tests
+
+Le projet est couvert par une suite de **285 tests** (`unittest`, aucune dépendance externe) :
+
+```bash
+bash run-tests.sh                 # tout
+bash run-tests.sh -v              # détail test par test
+bash run-tests.sh tests.test_openvpn   # un module
+```
+
+**La suite ne touche jamais au système.** `iptables`, `ip`, `resolvectl`, `systemctl`, `curl`, `openvpn` et `tor` sont interceptés et enregistrés au lieu d'être exécutés : les tests vérifient *quelles commandes auraient été lancées*, avec quels arguments et dans quel ordre. On peut donc lancer la suite sur la machine de production, tunnel monté, sans risque. `run-tests.sh` relève une empreinte réseau avant et après pour le prouver, et `tests/test_safety.py` interdit à un futur test de contourner cette règle.
+
+Ce qui est couvert, au-delà des chemins nominaux :
+
+| Domaine | Exemples de cas vérifiés |
+|---------|--------------------------|
+| Routes exclues | IPv6 refusé, réseau directement connecté ignoré (piège scope-link), CIDR normalisé |
+| ControlPort | consensus microdesc (8 champs) *et* ns (9 champs), une seule connexion pour N requêtes, plafond de 32 relais |
+| DNS | serveur/domaine `~.`/default-route contrôlés séparément, abstention si l'état est illisible |
+| Pare-feu | `DROP` toujours en dernière règle, refus de flusher l'uplink, reconstruction si le tunnel change de nom |
+| Qualité de circuit | seuil exact, plafond d'essais, thread périmé qui ne doit pas tuer le tunnel suivant |
+| Reconnexion | identifiants refusés vs coupure réseau, nombre de tentatives borné |
+| Sécurité | `auth.tmp` en 0600 même sous umask permissif, aucun identifiant dans le socket de statut, anti-path-traversal de l'import |
+| Cohérence | version identique dans `constants.py` et les deux READMEs, `--script-security` absent du code |
+
+Plusieurs tests exercent aussi le système en **lecture seule** pour valider les parseurs contre la réalité plutôt que contre un échantillon figé (format de `/proc/net/dev`, sortie de `resolvectl status`).
 
 ---
 

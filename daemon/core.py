@@ -3,6 +3,7 @@ Daemon core : constantes, helpers, initialisation, run(), handle_signal().
 """
 
 import base64
+import copy
 import json
 import os
 import socket
@@ -56,10 +57,11 @@ def _sd_notify(msg: str):
     try:
         if path.startswith("@"):          # socket abstrait
             path = "\0" + path[1:]
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
-        s.connect(path)
-        s.send(msg.encode())
-        s.close()
+        # « with » plutôt qu'un close() en fin de bloc : sur exception, la
+        # fermeture ne dépend plus du ramasse-miettes.  Appelé toutes les 3 s.
+        with socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM) as s:
+            s.connect(path)
+            s.send(msg.encode())
     except Exception:
         pass
 
@@ -120,11 +122,20 @@ class DaemonCore:
     # ── Config ────────────────────────────────────────────────────────────────
 
     def _load_config(self) -> dict:
+        # deepcopy et non dict() : les valeurs par défaut contiennent des
+        # listes (providers, excluded_ips…).  Une copie superficielle les
+        # partagerait avec DEFAULT_CONFIG, si bien qu'un ajout en place —
+        # le GUI fait « providers.append(...) » — muterait la constante du
+        # module pour tout le processus.
+        defaults = copy.deepcopy(DEFAULT_CONFIG)
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
         if CONFIG_FILE.exists():
             try:
                 with open(CONFIG_FILE) as f:
-                    return {**DEFAULT_CONFIG, **json.load(f)}
+                    loaded = json.load(f)
+                if not isinstance(loaded, dict):
+                    raise ValueError("config.json ne contient pas un objet JSON")
+                return {**defaults, **loaded}
             except Exception as e:
                 # config corrompue : la mettre de côté plutôt que de la perdre,
                 # et le signaler dans le journal (sinon démarrage en défauts muet).
@@ -135,7 +146,7 @@ class DaemonCore:
                               "démarrage avec les valeurs par défaut.", "ERROR")
                 except Exception:
                     pass
-        return dict(DEFAULT_CONFIG)
+        return defaults
 
     # ── Logging ───────────────────────────────────────────────────────────────
 
