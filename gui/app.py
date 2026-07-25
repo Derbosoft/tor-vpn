@@ -976,11 +976,17 @@ class ConfigApp:
                         text="Serveur DHCP automatique (dnsmasq)",
                         variable=self.lan_dhcp_var).pack(side=tk.LEFT)
 
+        # Interrupteur principal, et non une simple option de démarrage : le
+        # daemon n'active le partage que par ce réglage (il n'existe aucune
+        # activation manuelle).  Le libellé doit le dire, sous peine de
+        # laisser croire qu'une autre case reste à cocher quelque part.
         row5 = self._row(frame)
         self.lan_auto_var = tk.BooleanVar(value=False)
         ttk.Checkbutton(row5,
-                        text="Activer automatiquement au démarrage du service",
+                        text="Activer le partage LAN sur cette interface",
                         variable=self.lan_auto_var).pack(side=tk.LEFT)
+        tk.Label(row5, text="(prise en compte au démarrage du service)",
+                 fg=GRAY, bg=BG, font=("Segoe UI", 8)).pack(side=tk.LEFT, padx=4)
 
         help_frame = self._lf(parent, "Aide")
         tk.Label(help_frame,

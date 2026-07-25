@@ -118,7 +118,7 @@ class WatchdogMixin:
             rx   = self._read_tun0_rx()
             d_rx = max(0, rx - self._last_rx) if self._last_rx else 0
             self._last_rx    = rx
-            self._rx_history = self._rx_history[1:] + [float(d_rx)]
+            self._rx_history.append(float(d_rx))
 
             # ── Filet anti-inertie ────────────────────────────────────────
             # Les boucles Tor/OpenVPN abandonnent après un nombre borné de

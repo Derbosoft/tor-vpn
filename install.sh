@@ -33,7 +33,28 @@ fi
 # ── [1/6] Dépendances ────────────────────────────────────────────────────────
 echo "[1/6] Installation des dépendances …"
 apt-get update -qq
-apt-get install -y tor openvpn python3 python3-tk dnsutils dnsmasq curl
+apt-get install -y tor openvpn python3 python3-tk curl
+
+# dnsmasq ne sert QU'au partage LAN (fonction optionnelle, désactivée par
+# défaut).  On ne l'installe donc pas systématiquement pour le désactiver
+# aussitôt : uniquement s'il est déjà présent ou si le partage est configuré.
+LAN_CONFIGURED=false
+if [ -f "$CONFIG_DIR/config.json" ] && python3 -c "
+import json,sys
+d = json.load(open('$CONFIG_DIR/config.json'))
+sys.exit(0 if d.get('lan_auto') or d.get('lan_iface') else 1)
+" 2>/dev/null; then
+    LAN_CONFIGURED=true
+fi
+if command -v dnsmasq &>/dev/null; then
+    echo "    dnsmasq déjà présent (partage LAN disponible)"
+elif [ "$LAN_CONFIGURED" = true ]; then
+    echo "    Partage LAN configuré — installation de dnsmasq …"
+    apt-get install -y dnsmasq || true
+else
+    echo "    dnsmasq non installé (inutile : partage LAN désactivé)"
+    echo "    Si vous activez le partage LAN : sudo apt install dnsmasq"
+fi
 
 # ── [2/6] Répertoire de configuration ───────────────────────────────────────
 echo "[2/6] Répertoire de configuration …"
@@ -245,7 +266,7 @@ echo ""
 echo "── Vérification ────────────────────────────────────────"
 all_ok=true
 
-for bin in tor openvpn python3 curl dnsmasq; do
+for bin in tor openvpn python3 curl; do
     if command -v "$bin" &>/dev/null; then
         echo "  OK  $bin"
     else
@@ -253,6 +274,13 @@ for bin in tor openvpn python3 curl dnsmasq; do
         all_ok=false
     fi
 done
+
+# Optionnel : son absence ne doit pas faire échouer l'installation.
+if command -v dnsmasq &>/dev/null; then
+    echo "  OK  dnsmasq  (partage LAN disponible)"
+else
+    echo "  --  dnsmasq  absent — optionnel, requis seulement pour le partage LAN"
+fi
 
 python3 -c "import tkinter" 2>/dev/null \
     && echo "  OK  python3-tk" \

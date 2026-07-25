@@ -79,8 +79,8 @@ Le GUI et le daemon sont **entièrement découplés** : le GUI écrit uniquement
 | python3-tk | — | Interface graphique |
 | tor | — | Proxy SOCKS5 et réseau Tor |
 | openvpn | 2.4+ | Tunnel chiffré vers le fournisseur VPN |
-| dnsmasq | — | Serveur DHCP pour le partage LAN |
-| curl / dnsutils | — | Tests de connectivité et DNS |
+| dnsmasq | — | **Optionnel** — serveur DHCP, uniquement pour le partage LAN |
+| curl | — | Mesure de débit et tests de connectivité |
 | systemd + systemd-resolved | — | Gestion du service et DNS |
 
 ---
@@ -95,8 +95,9 @@ L'installateur effectue **6 étapes** :
 
 **1. Dépendances**
 ```bash
-apt install tor openvpn python3 python3-tk dnsutils dnsmasq curl
+apt install tor openvpn python3 python3-tk curl
 ```
+`dnsmasq` ne sert qu'au partage LAN (désactivé par défaut) : depuis la v3.6.1 il n'est installé que s'il est déjà présent ou si le partage est configuré, plutôt qu'installé puis désactivé aussitôt. Pour l'ajouter plus tard : `sudo apt install dnsmasq`.
 
 **2. Répertoire de configuration**
 - Crée `/etc/tor-vpn-manager/` en `root:torvpn 2770` (groupe torvpn : GUI sans root)
@@ -625,11 +626,14 @@ Le bouton **Réinitialiser** supprime le fichier torrc. Au prochain démarrage d
 **Ce que le script nettoie :**
 
 1. Processus OpenVPN et Tor résiduels (`pkill`)
-2. Chaînes ip6tables `TORVPN_KS6` (blocage IPv6)
-3. Chaînes iptables `TORVPN_LAN_FWD` (partage LAN)
-4. DNS systemd-resolved — supprime le drop-in et redémarre `systemd-resolved`
-5. Routes OpenVPN def1 bloquées (`0.0.0.0/1`, `128.0.0.0/1`, `default` sur tun0)
-6. Vérification de connectivité finale (`ip route get 1.1.1.1`, `getent ahosts`)
+2. Chaînes ip6tables `TORVPN_KS6` / `TORVPN_KS6_FWD` (blocage IPv6)
+3. Chaîne iptables `TORVPN_LAN_FWD`, dnsmasq du partage, et la règle NAT `MASQUERADE` associée
+4. DNS systemd-resolved — `resolvectl revert` sur `tun0` et `tun1`, suppression du drop-in, redémarrage de `systemd-resolved`
+5. Routes `/32` des relais Tor, lues dans `tor-vpn-routes.txt` — sans quoi le trafic vers ces IPs continuerait de contourner le tunnel après la réparation
+6. Routes OpenVPN def1 bloquées (`0.0.0.0/1`, `128.0.0.0/1`, `default`) sur `tun0` et `tun1`
+7. Vérification de connectivité finale (`ip route get 1.1.1.1`, `getent ahosts`)
+
+> Les points 3, 5 et l'extension à `tun1` datent de la v3.6.1 : le script laissait auparavant des routes `/32` et une règle NAT orphelines, et ne traitait que `tun0` alors que les `.ovpn` utilisent `dev tun`.
 
 ---
 

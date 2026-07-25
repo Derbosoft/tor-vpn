@@ -10,6 +10,7 @@ import subprocess
 import sys
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 # ── Imports projet ────────────────────────────────────────────────────────────
@@ -110,7 +111,9 @@ class DaemonCore:
 
         self._protected_routes: set = set()
 
-        self._rx_history = [0.0] * 60
+        # deque bornée : l'ajout chasse le plus ancien, sans recopier la liste
+        # à chaque tick du watchdog (toutes les 3 s).
+        self._rx_history = deque([0.0] * 60, maxlen=60)
         self._last_rx    = 0
 
     # ── Config ────────────────────────────────────────────────────────────────

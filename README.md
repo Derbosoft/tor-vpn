@@ -79,8 +79,8 @@ The GUI and the daemon are **fully decoupled**: the GUI only writes config files
 | python3-tk | — | GUI toolkit |
 | tor | — | SOCKS5 proxy and Tor network |
 | openvpn | 2.4+ | Encrypted tunnel to VPN provider |
-| dnsmasq | — | DHCP server for LAN sharing |
-| curl / dnsutils | — | Connectivity and DNS tests |
+| dnsmasq | — | **Optional** — DHCP server, only for LAN sharing |
+| curl | — | Throughput measurement and connectivity tests |
 | systemd + systemd-resolved | — | Service management and DNS |
 
 ---
@@ -95,8 +95,9 @@ The installer runs **6 steps**:
 
 **1. Dependencies**
 ```bash
-apt install tor openvpn python3 python3-tk dnsutils dnsmasq curl
+apt install tor openvpn python3 python3-tk curl
 ```
+`dnsmasq` is only used by LAN sharing (disabled by default): since v3.6.1 it is installed only if already present or if sharing is configured, rather than installed and immediately disabled. To add it later: `sudo apt install dnsmasq`.
 
 **2. Configuration directory**
 - Creates `/etc/tor-vpn-manager/` as `root:torvpn 2770` (torvpn group: root-less GUI)
@@ -626,11 +627,14 @@ The **Reset** button deletes the torrc file. On the next service start, Tor runs
 **What the script cleans:**
 
 1. Residual OpenVPN and Tor processes (`pkill`)
-2. ip6tables chains `TORVPN_KS6` (IPv6 blocking)
-3. iptables chains `TORVPN_LAN_FWD` (LAN sharing)
-4. systemd-resolved DNS — removes the drop-in and restarts `systemd-resolved`
-5. Blocked OpenVPN def1 routes (`0.0.0.0/1`, `128.0.0.0/1`, `default` on tun0)
-6. Final connectivity check (`ip route get 1.1.1.1`, `getent ahosts`)
+2. ip6tables chains `TORVPN_KS6` / `TORVPN_KS6_FWD` (IPv6 blocking)
+3. iptables chain `TORVPN_LAN_FWD`, the sharing dnsmasq, and the matching `MASQUERADE` NAT rule
+4. systemd-resolved DNS — `resolvectl revert` on `tun0` and `tun1`, drop-in removal, `systemd-resolved` restart
+5. Tor relay `/32` routes, read from `tor-vpn-routes.txt` — otherwise traffic to those IPs would keep bypassing the tunnel after the repair
+6. Blocked OpenVPN def1 routes (`0.0.0.0/1`, `128.0.0.0/1`, `default`) on `tun0` and `tun1`
+7. Final connectivity check (`ip route get 1.1.1.1`, `getent ahosts`)
+
+> Item 3, item 5 and the extension to `tun1` date from v3.6.1: the script previously left orphaned `/32` routes and a NAT rule behind, and only handled `tun0` even though the `.ovpn` files use `dev tun`.
 
 ---
 
