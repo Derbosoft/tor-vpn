@@ -99,21 +99,34 @@ class OpenVPNMixin:
     _PUSH_DNS_RE = re.compile(r"dhcp-option\s+DNS\s+(\d{1,3}(?:\.\d{1,3}){3})",
                               re.IGNORECASE)
 
+    # Directives OpenVPN qui exécutent un programme externe.  Le daemon ne
+    # passe plus « --script-security 2 » : OpenVPN refusera de les lancer.
+    _SCRIPT_DIRECTIVES = (
+        "up", "down", "up-restart", "down-pre", "route-up", "route-pre-down",
+        "ipchange", "client-connect", "client-disconnect", "learn-address",
+        "auth-user-pass-verify", "tls-verify",
+    )
+
     def _check_ovpn_scripts(self, cur_conf: str):
-        """Le DNS du VPN est appliqué nativement par le daemon (resolvectl).
-        On avertit seulement si le .ovpn référence un script up/down absent,
-        ce qui ferait échouer la connexion."""
+        """Avertit si le .ovpn référence un script externe, qu'il existe ou non.
+
+        Un script PRÉSENT est tout aussi problématique qu'un script absent :
+        update-resolv-conf écrase la configuration DNS que le daemon applique
+        lui-même via resolvectl.  Et sans --script-security 2, OpenVPN refuse
+        de l'exécuter : la connexion échoue."""
         try:
             text = Path(cur_conf).read_text(errors="ignore")
         except Exception:
             return
         for ln in text.splitlines():
             w = ln.strip().split()
-            if len(w) >= 2 and w[0] in ("up", "down") and not Path(w[1]).exists():
+            if len(w) >= 2 and w[0] in self._SCRIPT_DIRECTIVES:
                 self._log(
-                    f"Le .ovpn référence un script absent ({w[1]}) — la "
-                    "connexion échouera. Supprimez les lignes up/down : le "
-                    "daemon configure le DNS du VPN lui-même.", "ERROR")
+                    f"Le .ovpn contient une directive de script "
+                    f"({w[0]} {w[1]}) — la connexion échouera : l'exécution "
+                    "de scripts est désactivée par sécurité. Supprimez cette "
+                    "ligne, le daemon configure le DNS du VPN lui-même.",
+                    "ERROR")
                 return
 
     # ── Contrôle qualité du circuit Tor ──────────────────────────────────────
@@ -122,17 +135,24 @@ class OpenVPNMixin:
     _SPEED_BYTES = 2_000_000
     _SPEED_WAIT  = 5     # stabilisation du tunnel avant la mesure
 
-    def _measure_tunnel_speed(self, timeout: int = 40) -> float:
+    def _measure_tunnel_speed(self, iface: str = "", timeout: int = 40) -> float:
         """Débit descendant mesuré À TRAVERS le tunnel, en KB/s (-1 si échec).
 
         La mesure crée elle-même la demande qu'elle mesure : contrairement à
         une lecture passive des compteurs, un résultat faible signifie bien
-        « le lien est lent » et non « rien n'est demandé »."""
+        « le lien est lent » et non « rien n'est demandé ».
+
+        « --interface » lie la requête au tunnel : si celui-ci tombe pendant
+        la mesure, curl échoue au lieu de basculer sur la route par défaut —
+        ce qui fausserait le résultat et enverrait la requête hors Tor."""
         url = self._SPEED_URL.format(n=self._SPEED_BYTES)
+        cmd = ["curl", "-s", "-o", "/dev/null", "-w", "%{speed_download}",
+               "--max-time", str(timeout)]
+        if iface:
+            cmd += ["--interface", iface]
         try:
             r = subprocess.run(
-                ["curl", "-s", "-o", "/dev/null", "-w", "%{speed_download}",
-                 "--max-time", str(timeout), url],
+                cmd + [url],
                 capture_output=True, text=True, timeout=timeout + 10)
             bps = float(r.stdout.strip() or 0)
             return bps / 1024 if bps > 0 else -1.0
@@ -158,7 +178,23 @@ class OpenVPNMixin:
         if not self._tunnel_up or self._stop_vpn or self._stop_flag:
             return
 
-        kbs = self._measure_tunnel_speed()
+        # Processus et interface capturés AVANT la mesure : celle-ci dure
+        # jusqu'à ~50 s, pendant lesquelles le tunnel peut tomber et être
+        # remplacé par un autre.
+        proc = self.openvpn_process
+        tun  = self._tun_iface
+
+        kbs = self._measure_tunnel_speed(tun)
+
+        # Le résultat ne vaut que pour le tunnel mesuré.  Sans ce contrôle,
+        # un thread périmé interpréterait le débit d'un tunnel disparu et,
+        # pire, tuerait le processus qui a pris sa place.
+        if (proc is not self.openvpn_process or not self._tunnel_up
+                or self._stop_vpn or self._stop_flag):
+            self._log("[circuit] Tunnel renouvelé pendant la mesure — "
+                      "résultat ignoré.", "WARN")
+            return
+
         if kbs < 0:
             self._log("[circuit] Mesure du débit impossible — "
                       "circuit conservé.", "WARN")
@@ -188,8 +224,7 @@ class OpenVPNMixin:
         # réutiliser le même circuit, donc les mêmes relais lents.
         self._new_tor_circuit()
         self._circuit_retry = True
-        proc = self.openvpn_process
-        if proc and proc.poll() is None:
+        if proc and proc.poll() is None:   # proc : celui qu'on vient de mesurer
             proc.terminate()   # sans _stop_vpn : la boucle reconnecte d'elle-même
 
     def _wait_vpn_loop_exit(self, timeout: float = 15.0) -> bool:
@@ -260,7 +295,10 @@ class OpenVPNMixin:
                 "openvpn",
                 "--config",            cur_conf,
                 "--auth-user-pass",    str(AUTH_TMP),
-                "--script-security",   "2",
+                # Pas de --script-security 2 : aucun .ovpn n'a besoin de
+                # scripts (le daemon applique le DNS lui-même), et l'autoriser
+                # permettrait à quiconque peut écrire un .ovpn — le groupe
+                # torvpn — de faire exécuter du code par le daemon, en root.
                 "--verb",              "3",   # requis pour net_addr_v4_add
                 "--ping",              "10",
                 "--ping-exit",         "60",

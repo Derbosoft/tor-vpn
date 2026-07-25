@@ -707,14 +707,21 @@ class ConfigApp:
         if not raw:
             return
         try:
-            entry = str(ipaddress.ip_network(raw, strict=False))
+            net = ipaddress.ip_network(raw, strict=False)
         except ValueError:
-            try:
-                ipaddress.ip_address(raw)
-                entry = raw
-            except ValueError:
-                messagebox.showerror("IP invalide", f"'{raw}' n'est pas une IP/CIDR valide.")
-                return
+            messagebox.showerror("IP invalide", f"'{raw}' n'est pas une IP/CIDR valide.")
+            return
+        # L'exclusion repose sur « --route », une option IPv4 uniquement :
+        # une entrée IPv6 serait acceptée ici puis ignorée par OpenVPN, en
+        # laissant croire que le réseau est bien exclu du tunnel.
+        if net.version != 4:
+            messagebox.showerror(
+                "IPv6 non supporté",
+                f"'{raw}' est une adresse IPv6.\n\n"
+                "L'exclusion du tunnel repose sur --route, qui ne gère que "
+                "l'IPv4. Saisissez une adresse ou un réseau IPv4.")
+            return
+        entry = str(net)
         if entry not in self.ip_list.get(0, tk.END):
             self.ip_list.insert(tk.END, entry)
             self.ip_entry.delete(0, tk.END)

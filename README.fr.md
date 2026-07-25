@@ -1,9 +1,9 @@
-# Tor-VPN Manager — v3.6.0
+# Tor-VPN Manager — v3.6.1
 
 ![Python](https://img.shields.io/badge/Python-3.8+-blue?logo=python)
 ![Platform](https://img.shields.io/badge/Platform-Ubuntu%20%7C%20Debian-orange?logo=linux)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Version](https://img.shields.io/badge/Version-3.6.0-blue)
+![Version](https://img.shields.io/badge/Version-3.6.1-blue)
 ![Systemd](https://img.shields.io/badge/Systemd-service-lightgrey?logo=linux)
 
 > [English documentation](README.md)
@@ -222,6 +222,8 @@ Permet de router les requêtes DNS pour des domaines spécifiques vers votre ser
 
 CIDRs et IPs qui contournent le tunnel et passent par la passerelle locale. Le daemon injecte `--route <ip> <mask> net_gateway` dans la commande OpenVPN.
 
+> **IPv4 uniquement.** `--route` est une option IPv4 ; une entrée IPv6 serait acceptée puis ignorée par OpenVPN, en laissant croire à tort que le réseau est exclu. Depuis la v3.6.1, le GUI refuse la saisie et le daemon écarte ces entrées avec un avertissement dans le journal.
+
 **Cas d'usage typiques :**
 - Réseaux joignables **via un routeur** (autres VLAN, sites distants : `10.0.20.0/24`…)
 - Sous-réseau du serveur DNS s'il est derrière un routeur — **obligatoire si DNS split activé**
@@ -356,7 +358,6 @@ Si Tor crash, il est redémarré automatiquement (jusqu'à 5 fois avec délai de
 openvpn
   --config            <fichier.ovpn>
   --auth-user-pass    /etc/tor-vpn-manager/auth.tmp
-  --script-security   2
   --verb              3          ← requis pour net_addr_v4_add dans les logs
   --ping              10
   --ping-exit         60
@@ -366,6 +367,10 @@ openvpn
   --socks-proxy       127.0.0.1 9050
   [--route <ip> <mask> net_gateway ...]
 ```
+
+> **Depuis la v3.6.1 : plus de `--script-security 2`.** Aucun fichier `.ovpn` n'a besoin de scripts — le daemon applique lui-même le DNS du VPN via `resolvectl`. Autoriser l'exécution de scripts permettait en revanche à quiconque peut écrire un `.ovpn` (le groupe `torvpn`) de faire exécuter du code **par le daemon, en root**, via une simple directive `up`.
+>
+> Les exécutables **intégrés** d'OpenVPN restent autorisés au niveau 1 : sur OpenVPN 2.6+, le hook natif `/usr/libexec/openvpn/dns-updown` continue donc de fonctionner normalement. Seuls les scripts définis dans le `.ovpn` sont bloqués — et le daemon avertit désormais dans le journal si un `.ovpn` en contient un (`up`, `down`, `route-up`, `ipchange`, `tls-verify`…), qu'il existe sur le disque ou non.
 
 **Protection des routes Tor :**
 Dès qu'OpenVPN assigne une IP au tunnel (`net_addr_v4_add`, visible grâce à `--verb 3`), le daemon ajoute de façon **synchrone** des routes `/32` statiques vers toutes les IP de guards Tor actifs via la passerelle locale originale. Cela doit s'exécuter *avant* que le script `up` n'installe les routes `redirect-gateway`. Sans cette protection, Tor tenterait de joindre ses guards via le tunnel, créant une boucle qui coupe la connexion. Les routes sont persistées dans `/etc/tor-vpn-manager/tor-vpn-routes.txt` et supprimées proprement à chaque arrêt.
@@ -626,7 +631,7 @@ Le bouton **Réinitialiser** supprime le fichier torrc. Au prochain démarrage d
 
 ## Format config.json
 
-`/etc/tor-vpn-manager/config.json` — mode `600`, root uniquement.
+`/etc/tor-vpn-manager/config.json` — mode `660 root:torvpn`.
 
 ```json
 {
@@ -672,11 +677,15 @@ Le bouton **Réinitialiser** supprime le fichier torrc. Au prochain démarrage d
 
 ## Sécurité
 
-**Credentials VPN :** stockés en base64 dans `config.json`. C'est de l'obfuscation, **pas du chiffrement**. Le fichier est en mode `600` — accessible uniquement par root.
+**Credentials VPN :** stockés en base64 dans `config.json`. C'est de l'obfuscation, **pas du chiffrement**. Le fichier est en mode `660 root:torvpn`, dans un répertoire `2770 root:torvpn`.
 
-**auth.tmp :** écrit en mode `600` juste avant de lancer OpenVPN, supprimé dans le bloc `finally` dès qu'OpenVPN a lu le fichier.
+**auth.tmp :** créé directement en mode `600` (jamais exposé à l'umask) juste avant de lancer OpenVPN, supprimé dans le bloc `finally` dès qu'OpenVPN a lu le fichier.
 
-**torrc :** écrit en mode `600` — accessible uniquement par root.
+**torrc :** mode `660 root:torvpn`.
+
+**Portée du groupe `torvpn` :** ce groupe existe pour que le GUI tourne **sans root**. Il donne en contrepartie l'accès en écriture à des fichiers que le daemon consomme en root (`config.json`, `torrc`, `providers/*.ovpn`) — ses membres doivent donc être considérés comme des administrateurs de la machine. N'y ajoutez que des comptes de confiance. La v3.6.1 ferme le vecteur le plus direct en retirant `--script-security 2` (voir *Gestion d'OpenVPN*), mais le principe reste : `torvpn` ≈ privilèges élevés.
+
+**Scripts `.ovpn` :** l'exécution de scripts définis dans un `.ovpn` est désactivée. Un `.ovpn` qui en contient est signalé dans le journal et échouera à se connecter — supprimez la directive, le daemon gère le DNS lui-même.
 
 **Tor comme proxy :** le serveur VPN voit l'IP d'un nœud de sortie Tor, jamais votre IP réelle. Votre FAI voit que vous utilisez Tor, mais ne sait pas que vous utilisez un VPN ni quelle destination vous atteignez.
 

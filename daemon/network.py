@@ -53,6 +53,16 @@ class NetworkMixin:
             except ValueError:
                 self._log(f"Route ignorée (invalide) : {entry}", "WARN")
                 continue
+            # « --route » est une option IPv4 : une entrée IPv6 produirait
+            # « --route 2001:db8:: ffff:ffff:: net_gateway », un masque
+            # qu'OpenVPN ne sait pas appliquer.  L'exclusion serait sans
+            # effet — silencieusement.  (L'équivalent IPv6 est --route-ipv6,
+            # inutile ici : l'IPv6 est bloqué, pas routé.)
+            if net.version != 4:
+                self._log(
+                    f"Exclusion ignorée ({entry}) : IPv6 non supporté par "
+                    "--route. Utilisez une adresse ou un réseau IPv4.", "WARN")
+                continue
             # Un réseau directement connecté ne doit JAMAIS être routé via
             # net_gateway : sa route kernel (scope link, /24 par ex.) prime
             # déjà sur redirect-gateway (0.0.0.0/1) par longest-prefix-match,
