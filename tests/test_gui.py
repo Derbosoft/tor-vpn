@@ -4,6 +4,7 @@ Aucun Tk() n'est créé : on exerce la logique en substituant des faux widgets.
 """
 
 import copy
+import pathlib
 import unittest
 
 import gui.app as app
@@ -289,6 +290,36 @@ class DefaultConfigIntegrityTest(unittest.TestCase):
         self.assertEqual(DEFAULT_CONFIG["circuit_min_kbs"], 250)
         self.assertTrue(DEFAULT_CONFIG["circuit_check"])
         self.assertEqual(DEFAULT_CONFIG["circuit_max_retries"], 3)
+
+
+class GuiOptionRoundTripTest(unittest.TestCase):
+    """Toute case à cocher doit être LUE et ÉCRITE.
+
+    Le défaut classique du GUI est la case qui enregistre sans jamais se
+    recharger : la valeur est correcte dans config.json et fausse à l'écran.
+    On vérifie sur la source que chaque option booléenne apparaît des deux
+    côtés — création du widget, collecte, et rechargement."""
+
+    SRC = (pathlib.Path(__file__).resolve().parents[1] / "gui" / "app.py").read_text()
+
+    OPTIONS = ("auto_reconnect", "block_ipv6", "circuit_check", "random_account",
+               "lan_dhcp", "lan_auto", "autostart")
+
+    def test_chaque_option_est_lue_et_ecrite(self):
+        for cle in self.OPTIONS:
+            var = f"{cle}_var"
+            # tk.BooleanVar() ou tk.BooleanVar(value=…) selon l'option.
+            self.assertIn(f"self.{var} = tk.BooleanVar(", self.SRC,
+                          f"{cle} : pas de variable Tk")
+            self.assertIn(f'self.config["{cle}"]', self.SRC,
+                          f"{cle} : jamais écrit dans la config")
+            self.assertIn(f'self.{var}.set(self.config.get("{cle}"',
+                          self.SRC, f"{cle} : jamais rechargé à l'écran")
+
+    def test_options_du_gui_declarees_dans_les_defauts(self):
+        for cle in self.OPTIONS:
+            self.assertIn(cle, DEFAULT_CONFIG,
+                          f"{cle} exposé par le GUI mais absent de DEFAULT_CONFIG")
 
 
 if __name__ == "__main__":

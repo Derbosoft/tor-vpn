@@ -1,6 +1,6 @@
 from pathlib import Path
 
-VERSION       = "3.6.1"
+VERSION       = "3.6.2"
 SCRIPT_DIR    = Path(__file__).resolve().parent
 PROVIDERS_DIR = SCRIPT_DIR / "providers"
 CONFIG_DIR    = Path("/etc/tor-vpn-manager")
@@ -14,6 +14,12 @@ STATUS_SOCKET = Path("/run/tor-vpn-manager.sock")
 DEFAULT_CONFIG = {
     "providers":         [],
     "auto_reconnect":    True,
+    # Ordre de passage des comptes d'un fournisseur.  True : tiré au hasard à
+    # chaque entrée dans le fournisseur.  False : ordre de la liste, utile pour
+    # reproduire un incident (un refus d'identifiants intermittent devient
+    # déterministe).  L'ordre des FOURNISSEURS n'est jamais mélangé : il reste
+    # l'ordre de priorité défini dans la configuration.
+    "random_account":    True,
     "block_ipv6":        False,
     "excluded_ips":      [],
     "excluded_domains":  [],

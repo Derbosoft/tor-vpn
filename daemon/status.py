@@ -44,6 +44,15 @@ class StatusMixin:
                               if self._tunnel_up and self._tunnel_up_time else 0,
             "provider":       prov_name,
             "account_index":  self._current_account_idx,
+            # Comptes du fournisseur courant écartés temporairement après un
+            # refus d'authentification, sous la forme « numéro affiché →
+            # secondes restantes ».  Sans cette exposition, un compte relégué
+            # serait invisible et son absence inexplicable.
+            "accounts_cooldown": {
+                str(a + 1): int(fin - time.time())
+                for (p, a), fin in sorted(self._account_cooldown.items())
+                if p == self._current_provider_idx and fin > time.time()
+            },
             "rx_kbs":         round(rx_kbs, 1),
             # Qualité du circuit mesurée à la connexion.  0 = pas de mesure
             # valide pour le tunnel courant (contrôle désactivé, mesure

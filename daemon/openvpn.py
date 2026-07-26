@@ -10,6 +10,7 @@ Corrections critiques appliquées :
 """
 
 import os
+import random
 import re
 import subprocess
 import threading
@@ -18,6 +19,7 @@ from pathlib import Path
 
 from .core import (
     _run, _deobf, AUTH_TMP, SCRIPT_DIR, RECONNECT_DELAY, RECONNECT_MAX,
+    AUTH_COOLDOWN, AUTH_PASS_MAX, AUTH_PASS_DELAY,
 )
 
 
@@ -73,27 +75,88 @@ class OpenVPNMixin:
             self._current_account_idx,
         )
 
+    def _cooldown_restant(self, account_idx: int) -> float:
+        """Secondes de quarantaine restantes pour un compte du fournisseur
+        courant, 0 s'il est disponible."""
+        fin = self._account_cooldown.get(
+            (self._current_provider_idx, account_idx), 0.0)
+        return max(0.0, fin - time.time())
+
+    def _mettre_en_quarantaine(self, account_idx: int):
+        """Recule un compte refusé en fin d'ordre pour AUTH_COOLDOWN secondes."""
+        self._account_cooldown[(self._current_provider_idx, account_idx)] = \
+            time.time() + AUTH_COOLDOWN
+
+    def _plan_accounts(self):
+        """Fixe l'ordre de passage des comptes du fournisseur courant.
+
+        Tirage au hasard si config["random_account"], sinon ordre de la liste.
+        Les comptes en quarantaine sont relégués en FIN d'ordre — jamais
+        retirés : un refus d'authentification ne prouve pas qu'un compte est
+        mort, le quota de connexions simultanées produit le même message.
+        L'ordre est journalisé : sans lui, un incident survenu sur un tirage
+        donné serait impossible à reconstituer après coup."""
+        providers = self.config.get("providers", [])
+        if not (0 <= self._current_provider_idx < len(providers)):
+            self._account_order = []
+            self._account_pos   = 0
+            self._current_account_idx = 0
+            return
+        p = providers[self._current_provider_idx]
+        n = len(p.get("accounts", []))
+        libres  = [i for i in range(n) if not self._cooldown_restant(i)]
+        punis   = [i for i in range(n) if self._cooldown_restant(i)]
+        if self.config.get("random_account", True):
+            random.shuffle(libres)
+            random.shuffle(punis)
+        # Les deux groupes concaténés : l'ordre reste une permutation complète,
+        # donc « tous les comptes essayés » garde son sens.
+        ordre = libres + punis
+        if n > 1 and self.config.get("random_account", True):
+            self._log(f"[provider] {p.get('name','?')} : ordre des comptes tiré "
+                      f"au hasard → {' '.join(str(i+1) for i in ordre)}", "INFO")
+        if punis:
+            self._log(f"[provider] {p.get('name','?')} : "
+                      f"{len(punis)} compte(s) en quarantaine, essayé(s) en "
+                      f"dernier → {' '.join(str(i+1) for i in punis)}", "INFO")
+        self._account_order = ordre
+        self._account_pos   = 0
+        # Pas de compte : on laisse l'index à 0, _get_active_creds renverra None
+        # et l'appelant passera au fournisseur suivant.
+        self._current_account_idx = ordre[0] if ordre else 0
+
     def _try_failover(self) -> bool:
         providers = self.config.get("providers", [])
         if not providers:
             return False
         cur_p    = providers[self._current_provider_idx]
         accounts = cur_p.get("accounts", [])
-        if self._current_account_idx + 1 < len(accounts):
-            self._current_account_idx += 1
+        # Plan absent ou périmé.  Absent : _try_failover peut être appelé avant
+        # l'entrée dans la boucle.  Périmé : le GUI écrit config.json à chaud,
+        # donc un fournisseur peut gagner ou perdre des comptes en cours de
+        # route et l'ordre ne couvrirait plus la liste réelle.
+        if len(self._account_order) != len(accounts):
+            self._plan_accounts()
+        # On avance dans l'ordre planifié, pas dans l'ordre de la liste : la
+        # position dit combien de comptes ont déjà été essayés, ce qui reste
+        # vrai que l'ordre soit mélangé ou non.
+        if self._account_pos + 1 < len(self._account_order):
+            self._account_pos += 1
+            self._current_account_idx = self._account_order[self._account_pos]
             self._log(
-                f"Failover : compte {self._current_account_idx+1}/{len(accounts)} "
+                f"Failover : compte {self._current_account_idx+1} "
+                f"({self._account_pos+1}/{len(accounts)} essayés) "
                 f"chez {cur_p['name']}", "WARN")
             return True
         if self._current_provider_idx + 1 < len(providers):
             self._current_provider_idx += 1
-            self._current_account_idx  = 0
             next_p = providers[self._current_provider_idx]
             self._log(f"Failover : {cur_p['name']} épuisé → {next_p['name']}", "WARN")
+            self._plan_accounts()
             return True
         self._current_provider_idx = 0
-        self._current_account_idx  = 0
         self._log("Failover : tous les fournisseurs et comptes épuisés.", "ERROR")
+        self._plan_accounts()
         return False
 
     def _try_next_provider(self) -> bool:
@@ -107,9 +170,9 @@ class OpenVPNMixin:
         if self._current_provider_idx + 1 >= len(providers):
             return False
         self._current_provider_idx += 1
-        self._current_account_idx   = 0
         self._log(f"Fournisseur suivant : "
                   f"{providers[self._current_provider_idx]['name']}", "WARN")
+        self._plan_accounts()
         return True
 
     _PUSH_DNS_RE = re.compile(r"dhcp-option\s+DNS\s+(\d{1,3}(?:\.\d{1,3}){3})",
@@ -258,7 +321,7 @@ class OpenVPNMixin:
             time.sleep(0.1)
         return False
 
-    def _openvpn_loop(self, start_provider_idx: int = 0, start_account_idx: int = 0):
+    def _openvpn_loop(self, start_provider_idx: int = 0, start_account_idx=None):
         # Garde-fou : une seule boucle OpenVPN active à la fois.
         with self._vpn_lock:
             if self._vpn_loop_active:
@@ -271,9 +334,17 @@ class OpenVPNMixin:
             with self._vpn_lock:
                 self._vpn_loop_active = False
 
-    def _openvpn_loop_body(self, start_provider_idx: int, start_account_idx: int):
+    def _openvpn_loop_body(self, start_provider_idx: int, start_account_idx=None):
         self._current_provider_idx = start_provider_idx
-        self._current_account_idx  = start_account_idx
+        # Tirage de l'ordre des comptes, puis positionnement sur le compte
+        # demandé s'il est explicite (reprise après réparation d'urgence).
+        self._plan_accounts()
+        # « is not None » et non un test de vérité : 0 est un index de compte
+        # valide (le compte 1).  Avec « if start_account_idx », le compte 1
+        # n'aurait jamais pu être imposé explicitement.
+        if start_account_idx is not None and start_account_idx in self._account_order:
+            self._account_pos = self._account_order.index(start_account_idx)
+            self._current_account_idx = start_account_idx
         self._reconnect_vpn_count  = 0
         self._stop_vpn             = False
         self._circuit_attempts     = 0
@@ -397,6 +468,15 @@ class OpenVPNMixin:
                             self._tunnel_up      = True
                             self._tunnel_up_time = time.time()
                             self._reconnect_vpn_count = 0
+                            # Une connexion réussie clôt la série de refus : le
+                            # compteur de passes ne doit pas s'accumuler sur la
+                            # durée de vie du daemon.
+                            self._auth_passes = 0
+                            # Le compte qui vient de réussir n'est évidemment
+                            # pas à mettre à l'écart.
+                            self._account_cooldown.pop(
+                                (self._current_provider_idx,
+                                 self._current_account_idx), None)
                             # Nouveau circuit : la mesure du précédent ne le
                             # décrit plus.  Remise à zéro plutôt qu'héritage.
                             self._last_circuit_kbs = 0.0
@@ -455,10 +535,22 @@ class OpenVPNMixin:
             # ── Décision de reconnexion ──────────────────────────────────────
             # Deux causes de rupture, deux réponses différentes.
             #
-            # 1. Le serveur a REFUSÉ les identifiants : le compte est en cause
-            #    (mot de passe invalide, quota de connexions simultanées
-            #    atteint).  Changer de compte est la bonne réponse, et tout de
-            #    suite — s'acharner ne servirait à rien.
+            # 1. Le serveur a REFUSÉ les identifiants : le compte est en cause.
+            #    Changer de compte est la bonne réponse, et tout de suite —
+            #    s'acharner ne servirait à rien.
+            #
+            #    Mais le refus ne dit PAS pourquoi : le fournisseur envoie un
+            #    « AUTH_FAILED » nu, identique pour un mot de passe invalide et
+            #    pour un quota de connexions simultanées atteint.  Or les deux
+            #    cas s'opposent : le premier est définitif, le second est
+            #    temporaire (le compte remarche dès que l'autre session se
+            #    termine).  Constaté sur ce déploiement : le compte 1 d'iVPN a
+            #    renvoyé AUTH_FAILED les 12 et 18 juillet, et s'est connecté
+            #    sans problème une douzaine de fois depuis.
+            #
+            #    Réponse : quarantaine, pas exclusion.  Le compte recule en fin
+            #    d'ordre pendant AUTH_COOLDOWN, et reste essayé si les autres
+            #    échouent aussi.
             #
             # 2. Tout le reste (coupure réseau, TLS qui expire, ping-exit) : le
             #    compte n'y est pour rien.  En changer ne changerait d'ailleurs
@@ -473,13 +565,37 @@ class OpenVPNMixin:
             # de secondes, sans que la temporisation n'entre jamais en jeu.
             if self._auth_failed:
                 self._auth_failed = False
+                self._mettre_en_quarantaine(self._current_account_idx)
+                self._log(f"Compte {self._current_account_idx+1} refusé "
+                          f"({prov_name}) — mis en quarantaine "
+                          f"{AUTH_COOLDOWN//60} min (mot de passe invalide ou "
+                          f"connexions simultanées épuisées).", "WARN")
                 if self._try_failover():
-                    self._log("Identifiants refusés — compte suivant, "
-                              "reconnexion immédiate …", "WARN")
+                    self._log("Compte suivant, reconnexion immédiate …", "WARN")
                     time.sleep(3)
                     continue
-                self._log("Identifiants refusés sur tous les comptes de tous "
-                          "les fournisseurs.", "ERROR")
+                # Plus un seul compte disponible.  Ce n'est pas forcément un
+                # problème d'identifiants : tous les comptes peuvent être
+                # occupés au même instant.  On tente une seconde passe après
+                # temporisation avant de rendre la main à systemd.
+                self._auth_passes += 1
+                if self._auth_passes < AUTH_PASS_MAX:
+                    self._log(
+                        f"Aucun compte n'a pu s'authentifier (passe "
+                        f"{self._auth_passes}/{AUTH_PASS_MAX}) — nouvelle passe "
+                        f"dans {AUTH_PASS_DELAY}s : des comptes sont "
+                        f"peut-être simplement occupés.", "WARN")
+                    for _ in range(AUTH_PASS_DELAY):
+                        if self._stop_flag or self._stop_vpn:
+                            return
+                        time.sleep(1)
+                    self._current_provider_idx = 0
+                    self._plan_accounts()
+                    continue
+                self._log(
+                    f"Aucun compte n'a pu s'authentifier après "
+                    f"{AUTH_PASS_MAX} passes, chez aucun fournisseur — "
+                    "vérifiez les identifiants.", "ERROR")
                 break
 
             self._reconnect_vpn_count += 1

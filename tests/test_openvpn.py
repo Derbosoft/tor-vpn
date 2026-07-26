@@ -4,9 +4,11 @@ import os
 import pathlib
 import stat
 import tempfile
+import time
 import unittest
 
 import daemon.openvpn as m_openvpn
+from constants import DEFAULT_CONFIG
 from tests.helpers import (FakeDaemon, FakeProc, Recorder, no_sleep,
                            patched_run, patched_subprocess, provider)
 
@@ -16,6 +18,9 @@ AUTH_FAIL_MSG = ("AUTH: Received control message: AUTH_FAILED\n"
 AUTH_FAIL_ALT = "SIGTERM[soft,auth-failure] received, process exiting\n"
 NET_DROP_MSG  = ("Connection reset, restarting [0]\n"
                  "SIGUSR1[soft,connection-reset] received\n")
+# Tunnel réellement monté : c'est cette ligne, et elle seule, qui déclenche le
+# traitement « tunnel actif » du daemon.
+TUNNEL_UP_MSG = "Initialization Sequence Completed\n"
 
 
 class WriteAuthTmpTest(unittest.TestCase):
@@ -302,7 +307,10 @@ class FailoverDecisionTest(unittest.TestCase):
     """Correctif #4 : bascule de compte seulement si les identifiants sont refusés."""
 
     def test_failover_compte_puis_fournisseur(self):
-        d = FakeDaemon(config={"providers": [provider("a", 2), provider("b", 1)]})
+        # random_account désactivé : ce test porte sur la SÉQUENCE compte →
+        # fournisseur → épuisement, pas sur l'ordre de tirage.
+        d = FakeDaemon(config={"random_account": False,
+                               "providers": [provider("a", 2), provider("b", 1)]})
         self.assertTrue(d._try_failover())
         self.assertEqual((d._current_provider_idx, d._current_account_idx), (0, 1))
         self.assertTrue(d._try_failover())
@@ -311,7 +319,8 @@ class FailoverDecisionTest(unittest.TestCase):
         self.assertEqual((d._current_provider_idx, d._current_account_idx), (0, 0))
 
     def test_next_provider_saute_les_comptes(self):
-        d = FakeDaemon(config={"providers": [provider("a", 10), provider("b", 3)]})
+        d = FakeDaemon(config={"random_account": False,
+                               "providers": [provider("a", 10), provider("b", 3)]})
         self.assertTrue(d._try_next_provider())
         self.assertEqual((d._current_provider_idx, d._current_account_idx), (1, 0),
                          "les comptes du fournisseur courant n'ont pas été sautés")
@@ -320,6 +329,173 @@ class FailoverDecisionTest(unittest.TestCase):
 
     def test_next_provider_sans_fournisseur(self):
         self.assertFalse(FakeDaemon(config={"providers": []})._try_next_provider())
+
+
+class AccountCooldownTest(unittest.TestCase):
+    """Un compte refusé est relégué, JAMAIS exclu.
+
+    Motif tiré du déploiement réel : le fournisseur envoie un « AUTH_FAILED »
+    nu, sans distinguer un mot de passe invalide d'un quota de connexions
+    simultanées atteint.  Le compte 1 d'iVPN a été refusé les 12 et 18 juillet
+    puis s'est connecté une douzaine de fois — le refus était temporaire."""
+
+    @staticmethod
+    def _daemon(n=5, alea=False):
+        return FakeDaemon(config={"random_account": alea,
+                                  "providers": [provider("ivpn", n)]})
+
+    def test_compte_en_quarantaine_relegue_en_fin_dordre(self):
+        d = self._daemon()
+        d._plan_accounts()
+        d._mettre_en_quarantaine(0)
+        d._plan_accounts()
+        self.assertEqual(d._account_order[-1], 0,
+                         f"compte 1 non relégué : {d._account_order}")
+        self.assertNotEqual(d._current_account_idx, 0,
+                            "un compte en quarantaine ne doit pas être essayé en premier")
+
+    def test_quarantaine_n_exclut_jamais_le_compte(self):
+        """Le point de l'utilisateur : « ce compte n'est pas mort pour autant »."""
+        d = self._daemon()
+        for i in range(5):
+            d._mettre_en_quarantaine(i)
+        d._plan_accounts()
+        self.assertEqual(sorted(d._account_order), list(range(5)),
+                         "des comptes en quarantaine ont été retirés de l'ordre")
+
+    def test_ordre_reste_une_permutation_avec_quarantaines_partielles(self):
+        d = self._daemon(n=10, alea=True)
+        for i in (2, 5, 7):
+            d._mettre_en_quarantaine(i)
+        d._plan_accounts()
+        self.assertEqual(sorted(d._account_order), list(range(10)))
+        # Les trois punis occupent les trois dernières places, dans un ordre
+        # quelconque entre eux.
+        self.assertEqual(set(d._account_order[-3:]), {2, 5, 7})
+
+    def test_quarantaine_expire(self):
+        d = self._daemon()
+        d._mettre_en_quarantaine(3)
+        self.assertGreater(d._cooldown_restant(3), 0)
+        d._account_cooldown[(0, 3)] = time.time() - 1     # échue
+        self.assertEqual(d._cooldown_restant(3), 0)
+        d._plan_accounts()
+        self.assertEqual(sorted(d._account_order), list(range(5)))
+
+    def test_quarantaine_par_fournisseur(self):
+        """Le compte 1 de « a » et le compte 1 de « b » sont deux comptes."""
+        d = FakeDaemon(config={"random_account": False,
+                               "providers": [provider("a", 3), provider("b", 3)]})
+        d._mettre_en_quarantaine(0)
+        self.assertGreater(d._cooldown_restant(0), 0)
+        d._current_provider_idx = 1
+        self.assertEqual(d._cooldown_restant(0), 0,
+                         "la quarantaine a fuité sur un autre fournisseur")
+
+    def test_quarantaine_journalisee(self):
+        d = self._daemon()
+        d._mettre_en_quarantaine(1)
+        d._plan_accounts()
+        self.assertTrue(d.has_log("compte(s) en quarantaine"), d.log_dump())
+
+
+class RandomAccountOrderTest(unittest.TestCase):
+    """Comptes tirés au hasard, fournisseurs toujours dans l'ordre de priorité."""
+
+    @staticmethod
+    def _daemon(n_a=10, n_b=3, alea=True):
+        return FakeDaemon(config={
+            "random_account": alea,
+            "providers": [provider("a", n_a), provider("b", n_b)]})
+
+    def test_defaut_de_configuration_est_aleatoire(self):
+        self.assertTrue(DEFAULT_CONFIG["random_account"])
+
+    def test_ordre_fige_quand_desactive(self):
+        d = self._daemon(alea=False)
+        d._plan_accounts()
+        self.assertEqual(d._account_order, list(range(10)))
+        self.assertEqual(d._current_account_idx, 0)
+
+    def test_ordre_est_une_permutation_complete(self):
+        """Chaque compte exactement une fois : « épuisés » doit avoir un sens."""
+        for _ in range(30):
+            d = self._daemon()
+            d._plan_accounts()
+            self.assertEqual(sorted(d._account_order), list(range(10)),
+                             f"ordre non couvrant : {d._account_order}")
+
+    def test_le_tirage_varie_reellement(self):
+        """Garde-fou contre un shuffle sans effet (ordre figé par accident)."""
+        premiers = set()
+        for _ in range(40):
+            d = self._daemon()
+            d._plan_accounts()
+            premiers.add(d._account_order[0])
+        self.assertGreater(len(premiers), 1,
+                           "le tirage rend toujours le même premier compte")
+
+    def test_tous_les_comptes_essayes_avant_le_fournisseur_suivant(self):
+        d = self._daemon()
+        d._plan_accounts()
+        vus = [d._current_account_idx]
+        while d._current_provider_idx == 0:
+            if not d._try_failover():
+                break
+            if d._current_provider_idx == 0:
+                vus.append(d._current_account_idx)
+        self.assertEqual(sorted(vus), list(range(10)),
+                         f"comptes de « a » non épuisés avant bascule : {vus}")
+        self.assertEqual(d._current_provider_idx, 1)
+
+    def test_ordre_des_fournisseurs_jamais_melange(self):
+        """La priorité des fournisseurs est celle de la configuration."""
+        for _ in range(10):
+            d = self._daemon(n_a=2, n_b=2)
+            d._plan_accounts()
+            noms = [d.config["providers"][d._current_provider_idx]["name"]]
+            for _ in range(6):
+                if not d._try_failover():
+                    break
+                nom = d.config["providers"][d._current_provider_idx]["name"]
+                if nom != noms[-1]:
+                    noms.append(nom)
+            self.assertEqual(noms, ["a", "b"], f"priorité non respectée : {noms}")
+
+    def test_ordre_tire_est_journalise(self):
+        """Sans la trace, un incident sur un tirage donné serait irreproductible."""
+        d = self._daemon()
+        d._plan_accounts()
+        self.assertTrue(d.has_log("ordre des comptes tiré au hasard"),
+                        d.log_dump())
+
+    def test_compte_unique_pas_de_journal_de_tirage(self):
+        d = FakeDaemon(config={"random_account": True,
+                               "providers": [provider("a", 1)]})
+        d._plan_accounts()
+        self.assertEqual(d._account_order, [0])
+        self.assertFalse(d.has_log("tiré au hasard"),
+                         "un seul compte : rien à tirer, rien à journaliser")
+
+    def test_replan_si_le_nombre_de_comptes_change_a_chaud(self):
+        """Le GUI écrit config.json en cours de route : l'ordre doit suivre."""
+        d = self._daemon(n_a=10, alea=False)
+        d._plan_accounts()
+        d.config["providers"][0]["accounts"] = \
+            d.config["providers"][0]["accounts"][:3]
+        self.assertTrue(d._try_failover())
+        self.assertEqual(len(d._account_order), 3,
+                         "l'ordre n'a pas été replanifié après réduction")
+        self.assertLess(d._current_account_idx, 3)
+
+    def test_fournisseur_sans_compte_ne_casse_pas_le_plan(self):
+        d = FakeDaemon(config={"random_account": True,
+                               "providers": [{"name": "vide", "ovpn_file": "/dev/null",
+                                              "accounts": []}]})
+        d._plan_accounts()
+        self.assertEqual(d._account_order, [])
+        self.assertEqual(d._current_account_idx, 0)
+        self.assertFalse(d._try_failover())
 
 
 class ReconnectLoopTest(unittest.TestCase):
@@ -337,8 +513,12 @@ class ReconnectLoopTest(unittest.TestCase):
         m_openvpn.AUTH_TMP = self._saved_auth
         self._tmp.cleanup()
 
-    def _run_loop(self, providers, sorties):
-        d = FakeDaemon(config={"providers": providers, "auto_reconnect": True})
+    def _prepare(self, d):
+        """Neutralise tout ce qui toucherait au système, et espionne les essais.
+
+        Extrait de _run_loop pour que les tests qui doivent construire le
+        daemon eux-mêmes (état de quarantaine préalable) partagent exactement
+        le même environnement simulé."""
         d._orig_gw, d._orig_iface = "10.0.50.254", "ens18"
         d.tentatives = []
         d._check_socks_port = lambda: True
@@ -361,6 +541,15 @@ class ReconnectLoopTest(unittest.TestCase):
             return r
 
         d._get_active_creds = creds_espion
+        return d
+
+    def _run_loop(self, providers, sorties, random_account=False):
+        # Par défaut l'ordre des comptes est figé : ces tests portent sur la
+        # DÉCISION de reconnexion, qui doit être vérifiable pas à pas.  Les
+        # tests du tirage aléatoire passent random_account=True explicitement.
+        d = self._prepare(FakeDaemon(
+            config={"providers": providers, "auto_reconnect": True,
+                    "random_account": random_account}))
         restants = list(sorties)
 
         def popen(cmd, **kw):
@@ -370,7 +559,7 @@ class ReconnectLoopTest(unittest.TestCase):
 
         with patched_run(Recorder()), no_sleep(m_openvpn), \
                 patched_subprocess(m_openvpn, Recorder(), popen=popen):
-            d._openvpn_loop_body(0, 0)
+            d._openvpn_loop_body(0)
         return d
 
     def test_coupure_reseau_garde_le_meme_compte(self):
@@ -380,6 +569,26 @@ class ReconnectLoopTest(unittest.TestCase):
         comptes_ivpn = {n for p, n in d.tentatives if p == "ivpn"}
         self.assertEqual(comptes_ivpn, {1},
                          f"changement de compte sur une coupure réseau : {d.tentatives}")
+
+    def test_coupure_reseau_garde_le_meme_compte_meme_tire_au_hasard(self):
+        """Le tirage aléatoire ne doit pas ressusciter la rafale du #4.
+
+        Une coupure réseau n'est pas la faute du compte : quel que soit le
+        compte tiré au départ, la boucle doit s'y tenir."""
+        for _ in range(10):
+            d = self._run_loop([provider("ivpn", 10, str(self.ovpn))],
+                               [NET_DROP_MSG] * 4, random_account=True)
+            comptes = {n for p, n in d.tentatives if p == "ivpn"}
+            self.assertEqual(len(comptes), 1,
+                             f"changement de compte sur coupure réseau : {d.tentatives}")
+
+    def test_identifiants_refuses_parcourt_des_comptes_distincts(self):
+        """Refus d'identifiants : chaque essai doit viser un compte NEUF."""
+        d = self._run_loop([provider("ivpn", 5, str(self.ovpn))],
+                           [AUTH_FAIL_MSG] * 4 + [""], random_account=True)
+        comptes = [n for p, n in d.tentatives if p == "ivpn"][:5]
+        self.assertEqual(len(set(comptes)), len(comptes),
+                         f"un compte a été retenté : {d.tentatives}")
 
     def test_coupure_reseau_bascule_de_fournisseur_apres_le_plafond(self):
         d = self._run_loop([provider("ivpn", 10, str(self.ovpn)),
@@ -398,12 +607,100 @@ class ReconnectLoopTest(unittest.TestCase):
                            [AUTH_FAIL_MSG, AUTH_FAIL_MSG, AUTH_FAIL_MSG, ""])
         self.assertEqual([n for _, n in d.tentatives][:4], [1, 2, 3, 4],
                          f"pas de bascule immédiate : {d.tentatives}")
-        self.assertTrue(d.has_log("Identifiants refusés", "WARN"))
+        self.assertTrue(d.has_log("refusé", "WARN"))
+        self.assertTrue(d.has_log("mis en quarantaine", "WARN"))
 
     def test_signature_sigterm_auth_failure_seule_suffit(self):
         d = self._run_loop([provider("ivpn", 3, str(self.ovpn))],
                            [AUTH_FAIL_ALT, ""])
         self.assertEqual([n for _, n in d.tentatives][:2], [1, 2])
+
+    def test_tous_les_comptes_refuses_retente_une_seconde_passe(self):
+        """« Tous occupés au même moment » ne doit pas rendre la main aussitôt."""
+        d = self._run_loop([provider("ivpn", 2, str(self.ovpn))],
+                           [AUTH_FAIL_MSG] * 8)
+        self.assertTrue(d.has_log("nouvelle passe", "WARN"), d.log_dump())
+        self.assertEqual(len(d.tentatives), 4,
+                         f"2 comptes × 2 passes attendus : {d.tentatives}")
+        self.assertTrue(d.has_log("après 2 passes", "ERROR"),
+                        "l'abandon final doit rester explicite")
+
+    def _lance(self, d, sorties, start_account_idx="absent"):
+        restants = list(sorties)
+
+        def popen(cmd, **kw):
+            p = FakeProc(restants.pop(0) if restants else "")
+            d.openvpn_process = p
+            return p
+
+        with patched_run(Recorder()), no_sleep(m_openvpn), \
+                patched_subprocess(m_openvpn, Recorder(), popen=popen):
+            if start_account_idx == "absent":
+                d._openvpn_loop_body(0)
+            else:
+                d._openvpn_loop_body(0, start_account_idx)
+        return d
+
+    def test_compte_1_peut_etre_impose_explicitement(self):
+        """L'index 0 est un compte valide, pas une absence de valeur.
+
+        Avec un test de vérité (« if start_account_idx »), le compte 1 aurait
+        été confondu avec « non spécifié » et n'aurait jamais pu être imposé."""
+        d = self._prepare(FakeDaemon(config={
+            "providers": [provider("ivpn", 5, str(self.ovpn))],
+            "auto_reconnect": True, "random_account": False}))
+        d._mettre_en_quarantaine(0)          # sinon relégué en fin d'ordre
+        self._lance(d, [TUNNEL_UP_MSG], start_account_idx=0)
+        self.assertEqual(d.tentatives[0], ("ivpn", 1),
+                         f"le compte 1 imposé n'a pas été utilisé : {d.tentatives}")
+
+    def test_sans_compte_impose_la_quarantaine_decide(self):
+        """Sans index explicite, un compte puni ne doit pas être choisi."""
+        d = self._prepare(FakeDaemon(config={
+            "providers": [provider("ivpn", 5, str(self.ovpn))],
+            "auto_reconnect": True, "random_account": False}))
+        d._mettre_en_quarantaine(0)
+        self._lance(d, [TUNNEL_UP_MSG])
+        self.assertNotEqual(d.tentatives[0], ("ivpn", 1),
+                            f"un compte en quarantaine a été choisi : {d.tentatives}")
+
+    def test_abandon_ne_parle_plus_d_identifiants_seuls(self):
+        """Le diagnostic doit mentionner les deux causes possibles."""
+        d = self._run_loop([provider("ivpn", 1, str(self.ovpn))],
+                           [AUTH_FAIL_MSG] * 4)
+        quarantaine = [m for l, m in d.logs if "quarantaine" in m]
+        self.assertTrue(quarantaine, d.log_dump())
+        self.assertIn("connexions simultanées", quarantaine[0],
+                      "le message n'évoque pas le quota de connexions")
+
+    def test_connexion_reussie_leve_la_quarantaine_du_compte(self):
+        """Un compte puni qui finit par se connecter doit sortir de quarantaine.
+
+        Sans cela, un compte simplement occupé resterait relégué 15 min après
+        être redevenu libre."""
+        d = FakeDaemon(config={"providers": [provider("ivpn", 3, str(self.ovpn))],
+                               "auto_reconnect": True, "random_account": False})
+        d._mettre_en_quarantaine(0)
+        self.assertGreater(d._cooldown_restant(0), 0)
+
+        d = self._prepare(d)
+        restants = [TUNNEL_UP_MSG]
+
+        def popen(cmd, **kw):
+            p = FakeProc(restants.pop(0) if restants else "")
+            d.openvpn_process = p
+            return p
+
+        with patched_run(Recorder()), no_sleep(m_openvpn), \
+                patched_subprocess(m_openvpn, Recorder(), popen=popen):
+            # Le compte 0 est puni, donc relégué ; on force le daemon dessus
+            # pour observer la levée à la connexion.
+            d._openvpn_loop_body(0, 0)
+
+        self.assertTrue(d._tunnel_up or d.has_log("Tunnel VPN actif", "OK"),
+                        d.log_dump())
+        self.assertEqual(d._cooldown_restant(0), 0,
+                         "la quarantaine n'a pas été levée après une connexion")
 
     def test_nombre_de_tentatives_borne(self):
         """Le point de #4 : plus de rafale de dizaines d'authentifications."""

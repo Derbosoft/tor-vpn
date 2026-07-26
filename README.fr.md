@@ -1,9 +1,9 @@
-# Tor-VPN Manager — v3.6.1
+# Tor-VPN Manager — v3.6.2
 
 ![Python](https://img.shields.io/badge/Python-3.8+-blue?logo=python)
 ![Platform](https://img.shields.io/badge/Platform-Ubuntu%20%7C%20Debian-orange?logo=linux)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Version](https://img.shields.io/badge/Version-3.6.1-blue)
+![Version](https://img.shields.io/badge/Version-3.6.2-blue)
 ![Systemd](https://img.shields.io/badge/Systemd-service-lightgrey?logo=linux)
 
 > [English documentation](README.md)
@@ -216,7 +216,7 @@ Gère la liste des fournisseurs VPN et leurs comptes. L'ordre de la liste défin
 **Comptes par fournisseur :**
 - Chaque fournisseur peut avoir plusieurs comptes (identifiant + mot de passe)
 - Stockés en base64 dans `config.json` (obfuscation simple, voir [Sécurité](#sécurité))
-- Boutons ↑ ↓ pour réordonner ; le daemon tente les comptes dans l'ordre
+- Boutons ↑ ↓ pour réordonner ; l'ordre ne sert que si `random_account` est désactivé, le daemon tirant sinon un ordre au hasard (voir [Choix du compte](#choix-du-compte--aléatoire-par-fournisseur))
 
 **Failover automatique :** si les identifiants d'un compte sont refusés, le daemon passe au compte suivant du même fournisseur. Sur une coupure réseau, il réessaie le même compte avant de changer de fournisseur — voir [Failover et watchdog](#failover-et-watchdog).
 
@@ -345,7 +345,7 @@ Vérifie en une commande les invariants qui doivent tenir quand la connexion est
 
 ```
   [OK  ] Service                    actif
-  [OK  ] Version du daemon          3.6.1
+  [OK  ] Version du daemon          3.6.2
   [OK  ] Tor                        bootstrap terminé
   [OK  ] Tunnel                     tun0 depuis 17h27 (ivpn, compte 1)
   [OK  ] Qualité du circuit         592 KB/s (~4.7 Mbps), mesuré il y a 0h03
@@ -488,10 +488,11 @@ Quand le processus OpenVPN se termine, le daemon distingue **la nature de la rup
 
 | Cause détectée | Réponse | Délai |
 |----------------|---------|-------|
-| **Identifiants refusés** (`AUTH_FAILED` ou `SIGTERM[soft,auth-failure]`) | Compte suivant du même fournisseur | 3 s |
+| **Identifiants refusés** (`AUTH_FAILED` ou `SIGTERM[soft,auth-failure]`) | Compte mis en quarantaine 15 min, puis compte suivant | 3 s |
 | **Tout le reste** (coupure réseau, TLS expiré, `ping-exit`) | **Même compte**, jusqu'à `RECONNECT_MAX` (5) fois | 15 s |
-| Le même compte échoue 5 fois de suite | **Fournisseur suivant**, compte 1 | 3 s |
-| Plus aucun fournisseur de secours | Abandon → filet anti-inertie → relance systemd | — |
+| Le même compte échoue 5 fois de suite | **Fournisseur suivant** | 3 s |
+| Tous les comptes refusés, 1re passe | Nouvelle passe complète | 60 s |
+| Tous les comptes refusés, 2e passe | Abandon → filet anti-inertie → relance systemd | — |
 
 Le point clé : **changer de compte ne sert que si le compte est en cause.** Tous les comptes d'un fournisseur partagent le même fichier `.ovpn`, donc la même liste de serveurs — en changer n'a aucun effet sur une panne réseau ou côté serveur. Seul le changement de *fournisseur* en a.
 
@@ -571,9 +572,70 @@ Exemple réel :
 ### Logique de failover
 
 ```
-Fournisseur 1, Compte 1 → Fournisseur 1, Compte 2 → ... → Fournisseur 2, Compte 1 → ...
+Fournisseur 1, compte tiré → autre compte de 1 → ... → Fournisseur 2, compte tiré → ...
 Tous épuisés → retour au début → abandon après 5 tentatives
 ```
+
+### Choix du compte : aléatoire par fournisseur
+
+Depuis la v3.6.2, `random_account` (activé par défaut) tire **l'ordre de passage des comptes au hasard** à chaque entrée dans un fournisseur :
+
+```
+[INFO] [provider] ivpn : ordre des comptes tiré au hasard → 7 2 9 1 5 10 3 8 4 6
+[INFO] Fournisseur : ivpn  (compte 7)
+```
+
+**L'ordre des fournisseurs n'est jamais mélangé** : il reste l'ordre de priorité de la liste. Seuls les comptes *à l'intérieur* d'un fournisseur sont tirés, et le fournisseur suivant n'est atteint qu'une fois **tous** ses comptes essayés.
+
+Ce qui est tiré est un **ordre complet** (une permutation), pas un compte à chaque essai. La différence importe : avec un tirage indépendant à chaque tentative, « tous les comptes épuisés » n'aurait aucun sens — on pourrait retomber dix fois sur le même compte sans jamais couvrir la liste.
+
+Deux bénéfices :
+
+- **Répartition de l'usage.** Le compte 1 n'est plus systématiquement celui qui se connecte, ce qui évite de buter sur la limite de connexions simultanées d'un seul compte.
+- **Moins de corrélation.** Le fournisseur voit une IP de sortie Tor différente à chaque fois, mais toujours le même compte : cette régularité est un motif. Le tirage la casse.
+
+**Contrepartie, à connaître :** un compte aux identifiants périmés produit une panne *intermittente* au lieu d'être touché à coup sûr. C'est pourquoi l'ordre tiré est journalisé — sans cette ligne, un incident survenu sur un tirage donné serait impossible à reconstituer. Décochez « Choisir un compte au hasard » (onglet *Paramètres* → *Reconnexion*) pour revenir à l'ordre de la liste et rendre l'incident déterministe.
+
+> Le tirage ne s'applique qu'au **choix** d'un compte neuf : au démarrage et sur un refus d'identifiants. Une coupure réseau continue de réessayer **le même** compte — la logique du tableau ci-dessus est inchangée.
+
+### Quarantaine : un compte refusé n'est pas un compte mort
+
+Le fournisseur envoie un `AUTH_FAILED` **nu, sans motif**. Ce message unique recouvre deux causes opposées :
+
+| Cause | Nature | Bonne réponse |
+|-------|--------|---------------|
+| Mot de passe invalide | Définitive | Ne plus utiliser ce compte |
+| Quota de connexions simultanées atteint | **Temporaire** — quelqu'un d'autre est connecté | Réessayer plus tard |
+
+**Le daemon ne peut pas les distinguer.** Observé sur ce déploiement : le compte 1 d'iVPN a renvoyé `AUTH_FAILED` les 12 et 18 juillet 2026, puis s'est connecté sans incident une douzaine de fois les jours suivants. Le refus était temporaire.
+
+La réponse est donc une **quarantaine et non une exclusion** (`AUTH_COOLDOWN`, 15 min) :
+
+```
+[WARN] Compte 2 refusé (ivpn) — mis en quarantaine 15 min (mot de passe
+       invalide ou connexions simultanées épuisées).
+[WARN] Failover : compte 4 (2/10 essayés) chez ivpn
+...
+[INFO] [provider] ivpn : ordre des comptes tiré au hasard → 4 10 8 1 9 6 7 3 5 2
+[INFO] [provider] ivpn : 1 compte(s) en quarantaine, essayé(s) en dernier → 2
+```
+
+Le compte puni **recule en fin d'ordre, sans jamais quitter la liste**. Conséquences :
+
+- Un compte simplement occupé n'est plus choisi en priorité, mais **reste essayé** si tous les autres échouent aussi.
+- Un compte réellement mort s'enfonce durablement en fin d'ordre : chaque nouvel échec renouvelle sa quarantaine.
+- Une connexion réussie **lève immédiatement** la quarantaine du compte concerné : inutile de le pénaliser 15 min de plus une fois redevenu libre.
+
+**Plus d'abandon dès la première passe.** Si tous les comptes de tous les fournisseurs sont refusés, le daemon attend `AUTH_PASS_DELAY` (60 s) et refait **une passe complète** (`AUTH_PASS_MAX` = 2) avant de rendre la main à systemd. Motif : « tous occupés au même instant » est transitoire. Sans cette seconde passe, le scénario aboutissait à ~145 s d'indisponibilité et à un redémarrage complet du daemon — donc à un nouveau bootstrap Tor et à des circuits neufs à re-mesurer — pour une cause qui se résout d'elle-même.
+
+L'état est consultable :
+
+```
+tor-vpn doctor
+  [WARN] Comptes en quarantaine     compte 2 (12 min) — essayés en dernier
+```
+
+> Le message d'abandon final ne parle plus d'« identifiants refusés » seuls : il nomme les deux causes possibles. L'ancien libellé orientait le diagnostic vers un mot de passe erroné alors que la cause la plus fréquente est le quota de connexions.
 
 ### Arrêt propre (SIGTERM / SIGINT)
 
@@ -725,6 +787,7 @@ Le bouton **Réinitialiser** supprime le fichier torrc. Au prochain démarrage d
     }
   ],
   "auto_reconnect": true,
+  "random_account": true,
   "block_ipv6": false,
   "excluded_ips": ["192.168.1.0/24", "10.0.50.0/24"],
   "excluded_domains": [".derbo"],
@@ -749,6 +812,7 @@ Le bouton **Réinitialiser** supprime le fichier torrc. Au prochain démarrage d
 | `excluded_ips` | liste | CIDRs/IPs passant par la passerelle locale |
 | `excluded_domains` | liste | Domaines routés vers le DNS local |
 | `local_dns` | string | IP du serveur DNS local |
+| `random_account` | bool | Ordre des comptes tiré au hasard chez chaque fournisseur (l'ordre des fournisseurs reste la priorité de la liste) |
 | `circuit_check` | bool | Mesure du débit à la connexion + re-tirage si circuit lent |
 | `circuit_min_kbs` | int | Seuil en KB/s (250 ≈ 2 Mbps ; 0 = désactivé) |
 | `circuit_max_retries` | int | Re-tirages max avant de conserver le circuit |

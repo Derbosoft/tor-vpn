@@ -3,6 +3,7 @@
 import json
 import pathlib
 import tempfile
+import time
 import unittest
 
 import daemon.core as m_core
@@ -133,6 +134,32 @@ class StatusSnapshotTest(unittest.TestCase):
     def test_fournisseur_sans_nom(self):
         d = FakeDaemon(config={"providers": [{"ovpn_file": "", "accounts": []}]})
         self.assertEqual(d._status_snapshot()["provider"], "")
+
+    def test_quarantaine_exposee_avec_le_temps_restant(self):
+        """Un compte écarté doit être visible, sinon son absence est inexplicable."""
+        d = FakeDaemon(config={"providers": [provider("ivpn", 3)]})
+        d._mettre_en_quarantaine(1)
+        quar = d._status_snapshot()["accounts_cooldown"]
+        self.assertIn("2", quar, f"compte 2 absent de {quar}")
+        self.assertGreater(quar["2"], 0)
+        self.assertNotIn("1", quar, "un compte libre ne doit pas apparaître")
+
+    def test_quarantaine_echue_absente_du_statut(self):
+        d = FakeDaemon(config={"providers": [provider("ivpn", 3)]})
+        d._account_cooldown[(0, 1)] = time.time() - 1
+        self.assertEqual(d._status_snapshot()["accounts_cooldown"], {})
+
+    def test_quarantaine_d_un_autre_fournisseur_non_melangee(self):
+        d = FakeDaemon(config={"providers": [provider("a", 3), provider("b", 3)]})
+        d._mettre_en_quarantaine(0)              # fournisseur 0
+        d._current_provider_idx = 1
+        self.assertEqual(d._status_snapshot()["accounts_cooldown"], {},
+                         "la quarantaine d'un autre fournisseur a fuité")
+
+    def test_quarantaine_serialisable(self):
+        d = FakeDaemon(config={"providers": [provider("ivpn", 3)]})
+        d._mettre_en_quarantaine(2)
+        json.dumps(d._status_snapshot())          # clés str obligatoires en JSON
 
 
 class SdNotifyTest(unittest.TestCase):

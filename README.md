@@ -1,9 +1,9 @@
-# Tor-VPN Manager — v3.6.1
+# Tor-VPN Manager — v3.6.2
 
 ![Python](https://img.shields.io/badge/Python-3.8+-blue?logo=python)
 ![Platform](https://img.shields.io/badge/Platform-Ubuntu%20%7C%20Debian-orange?logo=linux)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Version](https://img.shields.io/badge/Version-3.6.1-blue)
+![Version](https://img.shields.io/badge/Version-3.6.2-blue)
 ![Systemd](https://img.shields.io/badge/Systemd-service-lightgrey?logo=linux)
 
 > [Documentation en français](README.fr.md)
@@ -202,7 +202,7 @@ Manages VPN providers and their accounts. List order defines connection and fail
 **Accounts per provider:**
 - Each provider can have multiple accounts (username + password)
 - Stored as base64 in `config.json` (simple obfuscation, see [Security](#security))
-- ↑ ↓ buttons to reorder; the daemon tries accounts in order
+- ↑ ↓ buttons to reorder; the order only matters when `random_account` is off, otherwise the daemon draws an order at random (see [Account selection](#account-selection-random-within-each-provider))
 
 **Automatic failover:** if an account's credentials are refused, the daemon moves to the next account of the same provider. On a network drop it retries the same account before switching provider — see [Failover & Watchdog](#failover--watchdog).
 
@@ -454,10 +454,11 @@ When the OpenVPN process exits, the daemon determines **the nature of the failur
 
 | Detected cause | Response | Delay |
 |----------------|----------|-------|
-| **Credentials refused** (`AUTH_FAILED` or `SIGTERM[soft,auth-failure]`) | Next account of the same provider | 3 s |
+| **Credentials refused** (`AUTH_FAILED` or `SIGTERM[soft,auth-failure]`) | Account quarantined 15 min, then next account | 3 s |
 | **Everything else** (network drop, TLS timeout, `ping-exit`) | **Same account**, up to `RECONNECT_MAX` (5) times | 15 s |
-| Same account fails 5 times in a row | **Next provider**, account 1 | 3 s |
-| No fallback provider left | Give up → anti-inertia net → systemd relaunch | — |
+| Same account fails 5 times in a row | **Next provider** | 3 s |
+| Every account refused, 1st pass | One more full pass | 60 s |
+| Every account refused, 2nd pass | Give up → anti-inertia net → systemd relaunch | — |
 
 The key point: **switching accounts only helps when the account is at fault.** All accounts of a provider share the same `.ovpn` file, hence the same server list — switching has no effect on a network outage or a server-side problem. Only switching *provider* does.
 
@@ -537,9 +538,67 @@ Real-world example:
 ### Failover logic
 
 ```
-Provider 1, Account 1 → Provider 1, Account 2 → ... → Provider 2, Account 1 → ...
+Provider 1, drawn account → another account of 1 → ... → Provider 2, drawn account → ...
 All exhausted → back to start → give up after 5 attempts
 ```
+
+### Account selection: random within each provider
+
+Since v3.6.2, `random_account` (on by default) draws **the order in which accounts are tried at random** each time the daemon enters a provider:
+
+```
+[INFO] [provider] ivpn : ordre des comptes tiré au hasard → 7 2 9 1 5 10 3 8 4 6
+[INFO] Fournisseur : ivpn  (compte 7)
+```
+
+**Provider order is never shuffled**: it stays the priority order of the list. Only the accounts *within* a provider are drawn, and the next provider is reached only once **all** of its accounts have been tried.
+
+What gets drawn is a **complete order** (a permutation), not one account per attempt. The distinction matters: with an independent draw at every attempt, "all accounts exhausted" would be meaningless — the same account could come up ten times without ever covering the list.
+
+Two benefits:
+
+- **Usage spread.** Account 1 is no longer always the one connecting, which avoids hitting a single account's concurrent-connection limit.
+- **Less correlation.** The provider sees a different Tor exit IP every time, but always the same account — that regularity is a pattern. The draw breaks it.
+
+**Known trade-off:** an account with stale credentials produces an *intermittent* failure instead of being hit deterministically. That is why the drawn order is logged — without that line, an incident occurring on a given draw would be impossible to reconstruct. Uncheck "Choisir un compte au hasard" (*Paramètres* → *Reconnexion*) to return to list order and make the incident deterministic.
+
+> The draw only applies to **choosing** a fresh account: at startup and on a credentials refusal. A network drop still retries **the same** account — the logic in the table above is unchanged.
+
+### Quarantine: a refused account is not a dead account
+
+The provider sends a **bare `AUTH_FAILED`, with no reason**. That single message covers two opposite causes:
+
+| Cause | Nature | Right response |
+|-------|--------|----------------|
+| Invalid password | Permanent | Stop using that account |
+| Concurrent-connection limit reached | **Temporary** — someone else is connected | Retry later |
+
+**The daemon cannot tell them apart.** Observed on this deployment: iVPN account 1 returned `AUTH_FAILED` on 12 and 18 July 2026, then connected without incident a dozen times over the following days. The refusal was temporary.
+
+The response is therefore a **quarantine, not an exclusion** (`AUTH_COOLDOWN`, 15 min):
+
+```
+[WARN] Compte 2 refusé (ivpn) — mis en quarantaine 15 min (mot de passe
+       invalide ou connexions simultanées épuisées).
+[INFO] [provider] ivpn : 1 compte(s) en quarantaine, essayé(s) en dernier → 2
+```
+
+The penalised account **moves to the back of the order without ever leaving the list**. Consequences:
+
+- A merely busy account is no longer picked first, but is **still tried** if every other account fails too.
+- A genuinely dead account sinks durably to the back: each new failure renews its quarantine.
+- A successful connection **immediately clears** that account's quarantine — no point penalising it for another 15 min once it is free again.
+
+**No more giving up on the first pass.** If every account of every provider is refused, the daemon waits `AUTH_PASS_DELAY` (60 s) and runs **one more full pass** (`AUTH_PASS_MAX` = 2) before handing back to systemd. Reason: "all busy at the same moment" is transient. Without that second pass the scenario ended in ~145 s of downtime and a full daemon restart — hence a fresh Tor bootstrap and new circuits to re-measure — for a cause that resolves on its own.
+
+The state is inspectable:
+
+```
+tor-vpn doctor
+  [WARN] Comptes en quarantaine     compte 2 (12 min) — essayés en dernier
+```
+
+> The final give-up message no longer blames credentials alone: it names both possible causes. The old wording pushed the diagnosis toward a wrong password when the more frequent cause is the connection quota.
 
 ### Clean shutdown (SIGTERM / SIGINT)
 
@@ -691,6 +750,7 @@ The **Reset** button deletes the torrc file. On the next service start, Tor runs
     }
   ],
   "auto_reconnect": true,
+  "random_account": true,
   "block_ipv6": false,
   "excluded_ips": ["192.168.1.0/24", "10.0.50.0/24"],
   "excluded_domains": [".local"],
@@ -715,6 +775,7 @@ The **Reset** button deletes the torrc file. On the next service start, Tor runs
 | `excluded_ips` | list | CIDRs/IPs routed via local gateway |
 | `excluded_domains` | list | Domains routed to local DNS |
 | `local_dns` | string | Local DNS server IP |
+| `random_account` | bool | Account order drawn at random within each provider (provider order stays the list's priority) |
 | `circuit_check` | bool | Measure throughput on connect + re-draw if the circuit is slow |
 | `circuit_min_kbs` | int | Threshold in KB/s (250 ≈ 2 Mbps; 0 = disabled) |
 | `circuit_max_retries` | int | Max re-draws before keeping the circuit |

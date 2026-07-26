@@ -322,6 +322,7 @@ class ConfigApp:
         self.config["excluded_domains"] = list(self.domain_list.get(0, tk.END))
         self.config["local_dns"]        = self.dns_var.get().strip()
         self.config["auto_reconnect"]   = self.auto_reconnect_var.get()
+        self.config["random_account"]   = self.random_account_var.get()
         self.config["block_ipv6"]       = self.block_ipv6_var.get()
         self.config["autostart"]        = self.autostart_var.get()
         self.config["circuit_check"]    = self.circuit_check_var.get()
@@ -358,6 +359,7 @@ class ConfigApp:
         for ip in self.config.get("excluded_ips", []):
             self.ip_list.insert(tk.END, ip)
         self.auto_reconnect_var.set(self.config.get("auto_reconnect", True))
+        self.random_account_var.set(self.config.get("random_account", True))
         self.block_ipv6_var.set(self.config.get("block_ipv6", False))
         self.autostart_var.set(self.config.get("autostart", False))
         self.circuit_check_var.set(self.config.get("circuit_check", True))
@@ -780,6 +782,17 @@ class ConfigApp:
         ttk.Checkbutton(rec_frame,
                         text="Reconnexion automatique si la connexion tombe",
                         variable=self.auto_reconnect_var).pack(anchor=tk.W, pady=2)
+
+        self.random_account_var = tk.BooleanVar()
+        ttk.Checkbutton(
+            rec_frame,
+            text="Choisir un compte au hasard chez le fournisseur",
+            variable=self.random_account_var).pack(anchor=tk.W, pady=2)
+        tk.Label(rec_frame,
+                 text="L'ordre des fournisseurs reste celui de la liste "
+                      "(priorité).  Décocher pour reproduire un incident.",
+                 fg=GRAY, bg=BG, font=("Segoe UI", 8),
+                 justify=tk.LEFT).pack(anchor=tk.W, padx=20)
 
         cir_frame = self._lf(parent, "Qualité du circuit Tor")
         self.circuit_check_var = tk.BooleanVar()

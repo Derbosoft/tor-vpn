@@ -197,6 +197,17 @@ if st:
     elif st.get("tunnel_up"):
         note(WARN, "Qualité du circuit", "aucune mesure pour ce tunnel")
 
+    # Comptes écartés temporairement : ni une panne ni un état normal, une
+    # information.  Un refus d'authentification ne distingue pas un mot de
+    # passe invalide d'un quota de connexions simultanées atteint.
+    quar = st.get("accounts_cooldown") or {}
+    if quar:
+        detail = ", ".join(f"compte {n} ({s//60} min)"
+                           for n, s in sorted(quar.items(), key=lambda kv: int(kv[0])))
+        note(WARN, "Comptes en quarantaine", detail + " — essayés en dernier")
+    else:
+        note(OK, "Comptes", "aucun écarté")
+
 tun = st.get("tunnel_iface", "tun0")
 
 # ── 3. Routage ────────────────────────────────────────────────────────────────

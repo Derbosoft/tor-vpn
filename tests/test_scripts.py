@@ -263,6 +263,7 @@ class DoctorCommandTest(unittest.TestCase):
             ("tor-vpn-manager.sock", "état du daemon"),
             ("tor_ready", "bootstrap Tor"),
             ("last_circuit_kbs", "qualité du circuit"),
+            ("accounts_cooldown", "comptes en quarantaine"),
             ("route", "route par défaut et guards /32"),
             ("scope", "piège scope-link"),
             ("resolvectl", "DNS du tunnel"),

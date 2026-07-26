@@ -33,6 +33,17 @@ TOR_CTRL_PORT     = 9051
 RECONNECT_DELAY   = 15
 RECONNECT_MAX     = 5
 CONN_FAIL_MAX     = 2
+# Quarantaine d'un compte après un refus d'authentification.  Ni exclusion ni
+# oubli : le compte recule en fin d'ordre pendant ce délai.  Un refus ne dit pas
+# si le mot de passe est faux ou si le quota de connexions simultanées est
+# atteint — le fournisseur n'envoie qu'un « AUTH_FAILED » nu.  On traite donc le
+# cas récupérable : 15 min, l'ordre de grandeur d'une session tierce.
+AUTH_COOLDOWN     = 900
+# Passes complètes sur des refus avant d'abandonner à systemd.  Une seconde
+# passe, après temporisation, couvre le cas « tous les comptes occupés au même
+# moment » sans laisser une boucle marteler l'authentification du fournisseur.
+AUTH_PASS_MAX     = 2
+AUTH_PASS_DELAY   = 60
 REPAIR_THRESHOLD  = 3   # full_restarts consécutifs avant réparation d'urgence
 
 
@@ -91,6 +102,22 @@ class DaemonCore:
 
         self._current_provider_idx = 0
         self._current_account_idx  = 0
+        # Ordre de passage des comptes du fournisseur courant : indices de
+        # `accounts`, tirés au hasard si config["random_account"].  On garde un
+        # ordre explicite plutôt qu'un tirage à chaque essai, sinon « tous les
+        # comptes épuisés » n'aurait aucun sens — un tirage indépendant peut
+        # redonner dix fois le même compte et ne jamais couvrir la liste.
+        self._account_order        = []
+        self._account_pos          = 0
+        # Comptes ayant récemment essuyé un AUTH_FAILED : (idx_fournisseur,
+        # idx_compte) → horodatage de fin de quarantaine.  Un compte en
+        # quarantaine passe en FIN d'ordre, il n'est jamais exclu — un refus
+        # signifie souvent « quota de connexions simultanées atteint », donc un
+        # compte parfaitement valide qui remarchera plus tard.
+        self._account_cooldown     = {}
+        # Passes complètes (tous fournisseurs, tous comptes) épuisées sur des
+        # refus d'authentification.
+        self._auth_passes          = 0
         self._reconnect_vpn_count  = 0
         self._reconnect_tor_count  = 0
 

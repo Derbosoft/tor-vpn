@@ -179,9 +179,12 @@ class SuiteIntegrityTest(unittest.TestCase):
             ("script-security", "#7 exécution de scripts"),
             ("domaine ~.", "#13 contrôle DNS complet"),
             ("interface tunnel changée", "#5 partage LAN"),
-            ("Identifiants refusés", "#4 reconnexion"),
+            ("mis en quarantaine", "#4 reconnexion / quarantaine des comptes"),
+            ("compte(s) en quarantaine", "comptes refusés relégués, pas exclus"),
             ("tor-vpn-routes.txt", "repair_network complété"),
             ("deepcopy", "défauts partagés (trouvé par la suite)"),
+            ("ordre des comptes tiré au hasard", "comptes aléatoires"),
+            ("l'ordre n'a pas été replanifié", "replan à chaud des comptes"),
         ]:
             # Pas de dump de `couverture` dans le message : plusieurs Ko.
             self.assertTrue(marqueur in couverture,
