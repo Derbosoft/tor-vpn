@@ -318,11 +318,29 @@ sudo tor-vpn disable     # Disable autostart
 tor-vpn gui
 
 # Monitoring
-tor-vpn status           # Full state: service, Tor, VPN, split DNS, public IP
+tor-vpn status           # Full state: service, Tor, VPN, circuit, split DNS, public IP
+tor-vpn doctor           # Invariant diagnostics — OK/WARN/KO verdict
 tor-vpn logs [n]         # Last n lines of journal (default: 60)
 tor-vpn follow           # Live logs (Ctrl+C to exit)
 tor-vpn ip               # Current public IP
 ```
+
+
+### `tor-vpn doctor` — diagnostics
+
+Checks, in one command, the invariants that must hold when the connection is healthy. **Fully read-only and root-less**: no command modifies anything, no password prompt.
+
+| Check | Failure it catches |
+|-------|--------------------|
+| Default route | points at the tunnel → routing loop |
+| Guard protection | no `/32` route → Tor reaches its relays through the tunnel that depends on them |
+| Local networks | a directly-connected network overridden by a `via` route (scope-link trap) → segment access broken |
+| Tunnel DNS | missing server, `~.` or `default-route` → public queries outside the tunnel |
+| DNS query path | resolution too fast to be going through Tor → likely leak |
+| Circuit quality | measurement older than 6 h → the circuit may have degraded since |
+| Internet egress | no answer through the tunnel, or a private address |
+
+Exit code **0** when there is no KO, **1** otherwise — usable in a script or a scheduled job.
 
 ---
 

@@ -18,26 +18,63 @@ MUTANTES = ("iptables", "ip6tables", "ip route", "ip addr", "ip link set",
             "resolvectl", "systemctl", "pkill", "sysctl", "openvpn", "dnsmasq")
 
 
+def appels_subprocess(fichier):
+    """Appels RÉELS à subprocess dans un fichier, via l'AST.
+
+    Une analyse textuelle produirait des faux positifs dès qu'un test cite
+    « subprocess.run » dans une chaîne pour affirmer son absence ailleurs.
+    On inspecte donc les nœuds d'appel, pas le texte.
+    """
+    import ast
+    arbre = ast.parse(fichier.read_text())
+    trouves = []
+    for noeud in ast.walk(arbre):
+        if not isinstance(noeud, ast.Call):
+            continue
+        f = noeud.func
+        nom = ""
+        if isinstance(f, ast.Attribute):
+            base = f.value
+            if isinstance(base, ast.Name) and base.id == "subprocess":
+                nom = f.attr
+        if nom in ("run", "Popen", "call", "check_output", "check_call"):
+            argv = []
+            if noeud.args and isinstance(noeud.args[0], (ast.List, ast.Tuple)):
+                argv = [e.value for e in noeud.args[0].elts
+                        if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+            trouves.append((noeud.lineno, nom, argv))
+    return trouves
+
+
 class NoRealCommandTest(unittest.TestCase):
+    """Seuls `bash -n`, `git ls-files` et la lecture d'état sont admis."""
 
-    def test_les_tests_n_appellent_pas_subprocess_directement(self):
-        """Seules exceptions admises : `bash -n`, `py_compile`, `git ls-files`."""
-        autorises = ("bash", "-n", "git", "ls-files", "py_compile", "capture_output")
+    BINAIRES_ADMIS = {"bash", "git", "ip", "resolvectl", "systemctl"}
+    LECTURE_SEULE = {"-n", "ls-files", "show", "status", "is-active",
+                     "is-enabled", "query", "route", "rule", "link", "-4", "-br"}
+
+    def test_appels_subprocess_limites_et_en_lecture_seule(self):
         for f in TESTS:
-            if f.name in ("test_safety.py", "test_scripts.py"):
+            if f.name == "test_safety.py":
                 continue
-            for i, ligne in enumerate(f.read_text().splitlines(), 1):
-                if "subprocess.run(" in ligne or "subprocess.Popen(" in ligne:
-                    self.assertTrue(
-                        any(a in ligne for a in autorises),
-                        f"{f.name}:{i} appelle subprocess directement : {ligne.strip()}")
+            for ligne, nom, argv in appels_subprocess(f):
+                if not argv:
+                    continue
+                binaire = argv[0]
+                self.assertIn(binaire, self.BINAIRES_ADMIS,
+                              f"{f.name}:{ligne} exécute « {binaire} »")
+                self.assertTrue(
+                    any(a in self.LECTURE_SEULE for a in argv[1:]),
+                    f"{f.name}:{ligne} : {' '.join(argv)} n'est pas en lecture seule")
 
-    def test_test_scripts_n_execute_que_bash_n(self):
-        txt = (ROOT / "tests" / "test_scripts.py").read_text()
-        for ligne in txt.splitlines():
-            if "subprocess.run(" in ligne:
-                self.assertTrue("bash" in ligne or "git" in ligne,
-                                f"commande non autorisée : {ligne.strip()}")
+    def test_aucun_script_du_projet_execute_autrement_qu_en_bash_n(self):
+        for f in TESTS:
+            for ligne, _, argv in appels_subprocess(f):
+                joint = " ".join(argv)
+                for script in ("install.sh", "repair_network.sh", "tor-vpn-cli.sh"):
+                    if script in joint or any(script in a for a in argv):
+                        self.assertIn("-n", argv,
+                                      f"{f.name}:{ligne} exécute {script} sans « bash -n »")
 
     def test_aucun_chemin_systeme_en_ecriture(self):
         """Les tests ne doivent jamais viser /etc, /run ou /lib en écriture."""

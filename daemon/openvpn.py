@@ -216,6 +216,11 @@ class OpenVPNMixin:
                       "circuit conservé.", "WARN")
             return
         mbps = kbs * 8 / 1000
+        # Mesure conservée pour le socket de statut : elle est prise une seule
+        # fois, autant la rendre consultable au lieu de la laisser filer dans
+        # le journal.  Aucun trafic supplémentaire n'est généré.
+        self._last_circuit_kbs = kbs
+        self._last_circuit_at  = time.time()
 
         if kbs >= min_kbs:
             self._log(f"[circuit] Débit OK : {kbs:.0f} KB/s "
@@ -392,6 +397,10 @@ class OpenVPNMixin:
                             self._tunnel_up      = True
                             self._tunnel_up_time = time.time()
                             self._reconnect_vpn_count = 0
+                            # Nouveau circuit : la mesure du précédent ne le
+                            # décrit plus.  Remise à zéro plutôt qu'héritage.
+                            self._last_circuit_kbs = 0.0
+                            self._last_circuit_at  = 0.0
                             self._log("Tunnel VPN actif.", "OK")
                             # DNS du VPN d'abord (resolvectl sur l'interface),
                             # puis le split DNS (drop-in) qui garde la priorité

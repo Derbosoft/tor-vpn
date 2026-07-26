@@ -45,6 +45,14 @@ class StatusMixin:
             "provider":       prov_name,
             "account_index":  self._current_account_idx,
             "rx_kbs":         round(rx_kbs, 1),
+            # Qualité du circuit mesurée à la connexion.  0 = pas de mesure
+            # valide pour le tunnel courant (contrôle désactivé, mesure
+            # impossible, ou tunnel tout juste monté).  L'âge permet de savoir
+            # à quel point le chiffre est ancien : la mesure est unique, un
+            # circuit peut s'être dégradé depuis.
+            "last_circuit_kbs": round(self._last_circuit_kbs, 1),
+            "last_circuit_age": int(time.time() - self._last_circuit_at)
+                                if self._last_circuit_at else 0,
             "conn_failures":  self._conn_fail_count,
             "vpn_reconnects": self._reconnect_vpn_count,
             "full_restarts":  self._full_restart_count,

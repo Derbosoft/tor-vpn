@@ -477,5 +477,75 @@ class LoopGuardTest(unittest.TestCase):
         self.assertFalse(d._vpn_loop_active, "drapeau resté armé après exception")
 
 
+class LastCircuitMeasureTest(unittest.TestCase):
+    """La dernière mesure doit être consultable, et jamais héritée d'un
+    tunnel précédent — un chiffre périmé serait plus trompeur qu'absent."""
+
+    def _daemon(self, kbs, **cfg):
+        d = FakeDaemon(config={"circuit_check": True, "circuit_min_kbs": 250,
+                               "circuit_max_retries": 3, **cfg})
+        d._tunnel_up, d._tun_iface = True, "tun0"
+        d.openvpn_process = FakeProc(returncode=None)
+        d.openvpn_process._rc = None
+        d._measure_tunnel_speed = lambda iface="", timeout=40: kbs
+        d._new_tor_circuit = lambda: None
+        return d
+
+    def _run(self, d):
+        with no_sleep(m_openvpn):
+            d._circuit_quality_check()
+        return d
+
+    def test_mesure_conservee_quand_le_debit_est_bon(self):
+        d = self._run(self._daemon(592.0))
+        self.assertEqual(d._last_circuit_kbs, 592.0)
+        self.assertGreater(d._last_circuit_at, 0)
+
+    def test_mesure_conservee_meme_si_le_debit_est_faible(self):
+        """Un mauvais tirage doit rester visible, c'est justement l'intérêt."""
+        d = self._run(self._daemon(100.0))
+        self.assertEqual(d._last_circuit_kbs, 100.0)
+
+    def test_mesure_impossible_ne_falsifie_pas_la_valeur(self):
+        d = self._daemon(-1.0)
+        d._last_circuit_kbs = 0.0
+        self._run(d)
+        self.assertEqual(d._last_circuit_kbs, 0.0,
+                         "une mesure ratée ne doit pas être enregistrée")
+
+    def test_valeur_initiale_nulle(self):
+        d = FakeDaemon()
+        self.assertEqual(d._last_circuit_kbs, 0.0)
+        self.assertEqual(d._last_circuit_at, 0.0)
+
+    def test_controle_desactive_laisse_la_valeur_a_zero(self):
+        d = self._daemon(500.0, circuit_check=False)
+        self._run(d)
+        self.assertEqual(d._last_circuit_kbs, 0.0)
+
+
+class CircuitMeasureInStatusTest(unittest.TestCase):
+
+    def test_expose_dans_le_statut(self):
+        import time as _t
+        d = FakeDaemon(config={"providers": []})
+        d._last_circuit_kbs, d._last_circuit_at = 592.4, _t.time() - 7200
+        snap = d._status_snapshot()
+        self.assertEqual(snap["last_circuit_kbs"], 592.4)
+        self.assertAlmostEqual(snap["last_circuit_age"], 7200, delta=5)
+
+    def test_sans_mesure_les_champs_valent_zero(self):
+        d = FakeDaemon(config={"providers": []})
+        snap = d._status_snapshot()
+        self.assertEqual(snap["last_circuit_kbs"], 0.0)
+        self.assertEqual(snap["last_circuit_age"], 0,
+                         "un âge non nul sans mesure serait ininterprétable")
+
+    def test_statut_toujours_serialisable(self):
+        import json
+        d = FakeDaemon(config={"providers": []})
+        d._last_circuit_kbs, d._last_circuit_at = 1.0, 1.0
+        json.dumps(d._status_snapshot())
+
 if __name__ == "__main__":
     unittest.main()

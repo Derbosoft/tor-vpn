@@ -223,5 +223,73 @@ class GitignoreTest(unittest.TestCase):
             self.assertFalse(f.endswith("auth.tmp"), f)
 
 
+class DoctorCommandTest(unittest.TestCase):
+    """« tor-vpn doctor » : diagnostic en lecture seule, sans root."""
+
+    def test_commande_presente_et_documentee(self):
+        self.assertIn("    doctor)", CLI)
+        bloc = CLI[CLI.index("help|--help"):]
+        self.assertIn("doctor", bloc, "doctor absent de l'aide")
+
+    def test_n_exige_pas_root(self):
+        """Doit rester lançable par l'utilisateur, sans invite de mot de passe.
+
+        « sudo » peut apparaître dans un CONSEIL affiché (« sudo tor-vpn
+        restart ») : on vérifie donc l'absence d'INVOCATION privilégiée, pas
+        l'absence du mot."""
+        bloc = CLI[CLI.index("    doctor)"):]
+        bloc = bloc[:bloc.index("    logs)")]
+        self.assertNotIn("_need_root", bloc)
+        self.assertNotIn("pkexec", bloc)
+        for invocation in ('sh("sudo"', '"sudo",', 'subprocess.run(["sudo'):
+            self.assertNotIn(invocation, bloc, f"doctor invoque sudo : {invocation}")
+
+    def test_aucune_commande_mutante(self):
+        """Un diagnostic ne doit RIEN modifier sur la machine."""
+        bloc = CLI[CLI.index("    doctor)"):]
+        bloc = bloc[:bloc.index("    logs)")]
+        for interdit in ('"iptables"', '"ip6tables"', '"pkill"', '"sysctl"',
+                         '"restart"', '"stop"', '"start"',
+                         '"route", "add"', '"route", "del"',
+                         '"addr", "add"', '"addr", "flush"'):
+            self.assertNotIn(interdit, bloc,
+                             f"doctor exécute une commande mutante : {interdit}")
+
+    def test_verifie_les_invariants_attendus(self):
+        bloc = CLI[CLI.index("    doctor)"):]
+        bloc = bloc[:bloc.index("    logs)")]
+        for sonde, quoi in [
+            ("is-active", "état du service"),
+            ("tor-vpn-manager.sock", "état du daemon"),
+            ("tor_ready", "bootstrap Tor"),
+            ("last_circuit_kbs", "qualité du circuit"),
+            ("route", "route par défaut et guards /32"),
+            ("scope", "piège scope-link"),
+            ("resolvectl", "DNS du tunnel"),
+            ("~.", "domaine catch-all"),
+            ("Default Route", "default-route du tunnel"),
+            ("ipv6_blocked", "blocage IPv6"),
+            ("api.ipify.org", "sortie Internet réelle"),
+            ("--interface", "sortie liée au tunnel"),
+        ]:
+            self.assertIn(sonde, bloc, f"doctor ne vérifie pas : {quoi}")
+
+    def test_code_de_sortie_non_nul_si_probleme(self):
+        bloc = CLI[CLI.index("    doctor)"):]
+        self.assertIn("sys.exit(1 if n_ko else 0)", bloc)
+
+    def test_interface_uplink_non_codee_en_dur(self):
+        """Le nom de l'interface varie d'une machine à l'autre."""
+        bloc = CLI[CLI.index("    doctor)"):]
+        bloc = bloc[:bloc.index("    logs)")]
+        self.assertNotIn('"ens18"', bloc, "nom d'interface codé en dur")
+        self.assertIn('champs.index("dev")', bloc,
+                      "l'uplink devrait être dérivé de la route par défaut")
+
+    def test_statut_affiche_la_qualite_du_circuit(self):
+        bloc = CLI[CLI.index("    status)"):CLI.index("    doctor)")]
+        self.assertIn("last_circuit_kbs", bloc)
+        self.assertIn("last_circuit_age", bloc)
+
 if __name__ == "__main__":
     unittest.main()

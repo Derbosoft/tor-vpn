@@ -268,6 +268,11 @@ class ConfigApp:
                 info = (f" Actif — tunnel {st.get('tunnel_iface','?')} UP"
                         f" · {st.get('provider','?')}"
                         f" · {st.get('rx_kbs',0):.0f} KB/s")
+                # Qualité du circuit mesurée à la connexion : un mauvais
+                # tirage se voit ici sans avoir à lire le journal.
+                circuit = st.get("last_circuit_kbs", 0)
+                if circuit:
+                    info += f" · circuit {circuit:.0f} KB/s"
             elif st.get("tor_ready"):
                 info = " Actif — Tor prêt, VPN en connexion …"
             elif st:

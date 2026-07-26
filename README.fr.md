@@ -331,11 +331,50 @@ sudo tor-vpn disable     # Désactive le démarrage automatique
 tor-vpn gui
 
 # Surveillance
-tor-vpn status           # État complet : service, Tor, VPN, DNS split, IP publique
+tor-vpn status           # État complet : service, Tor, VPN, circuit, DNS split, IP publique
+tor-vpn doctor           # Diagnostic des invariants — verdict OK/WARN/KO
 tor-vpn logs [n]         # n dernières lignes de journal (défaut : 60)
 tor-vpn follow           # Logs en direct (Ctrl+C pour quitter)
 tor-vpn ip               # IP publique actuelle
 ```
+
+
+### `tor-vpn doctor` — diagnostic
+
+Vérifie en une commande les invariants qui doivent tenir quand la connexion est saine. **Entièrement en lecture seule et sans root** : aucune commande ne modifie quoi que ce soit, aucune invite de mot de passe.
+
+```
+  [OK  ] Service                    actif
+  [OK  ] Version du daemon          3.6.1
+  [OK  ] Tor                        bootstrap terminé
+  [OK  ] Tunnel                     tun0 depuis 17h27 (ivpn, compte 1)
+  [OK  ] Qualité du circuit         592 KB/s (~4.7 Mbps), mesuré il y a 0h03
+  [OK  ] Route par défaut           default via 10.0.50.254 dev ens18 (hors tunnel)
+  [OK  ] Protection des guards Tor  3 route(s) /32 hors tunnel
+  [OK  ] Redirection du trafic      2/2 routes def1 présentes
+  [OK  ] Réseaux locaux             2 réseau(x) en accès direct
+  [OK  ] DNS du tunnel              10.36.20.1 · ~. · default-route
+  [OK  ] DNS split                  drop-in en place
+  [OK  ] Chemin des requêtes DNS    128 ms (résolveur local via ens18 : 7 ms)
+  [OK  ] IPv6                       bloqué
+  [OK  ] Sortie Internet            IP publique 185.212.170.142
+
+  Tout est conforme.
+```
+
+Ce que chaque contrôle attrape :
+
+| Contrôle | Panne détectée |
+|----------|----------------|
+| Route par défaut | pointe sur le tunnel → boucle de routage |
+| Protection des guards | aucune route `/32` → Tor joint ses relais par le tunnel dont ils sont le support |
+| Réseaux locaux | un réseau directement connecté supplanté par une route `via` (piège scope-link) → accès au segment cassé |
+| DNS du tunnel | serveur, `~.` ou `default-route` manquant → requêtes publiques hors tunnel |
+| Chemin des requêtes DNS | résolution trop rapide pour passer par Tor → fuite probable |
+| Qualité du circuit | mesure de plus de 6 h → le circuit a pu se dégrader depuis |
+| Sortie Internet | pas de réponse via le tunnel, ou adresse privée |
+
+Code de sortie **0** si aucun KO, **1** sinon — utilisable dans un script ou une tâche planifiée.
 
 ---
 

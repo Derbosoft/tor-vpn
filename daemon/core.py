@@ -103,6 +103,12 @@ class DaemonCore:
         self._circuit_retry    = False  # reconnexion pour circuit (pas un failover)
         self._auth_failed      = False  # dernière rupture = refus d'identifiants
 
+        # Dernière mesure de débit du circuit courant.  0.0 signifie « aucune
+        # mesure valide pour ce tunnel » : remis à zéro à chaque tunnel monté,
+        # jamais hérité du tunnel précédent (ce serait trompeur).
+        self._last_circuit_kbs = 0.0
+        self._last_circuit_at  = 0.0
+
         self._vpn_dns_ips    = []
 
         self._tun_iface      = "tun0"
