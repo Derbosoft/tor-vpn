@@ -210,33 +210,118 @@ class OpenVPNMixin:
 
     # ── Contrôle qualité du circuit Tor ──────────────────────────────────────
 
-    _SPEED_URL   = "https://speed.cloudflare.com/__down?bytes={n}"
-    _SPEED_BYTES = 2_000_000
-    _SPEED_WAIT  = 5     # stabilisation du tunnel avant la mesure
+    _SPEED_URL     = "https://speed.cloudflare.com/__down?bytes={n}"
+    # Échauffement : petit et bon marché.  Son rôle est d'ouvrir la fenêtre de
+    # contrôle de flux du circuit Tor, pas de mesurer quoi que ce soit.
+    _SPEED_WARMUP_BYTES   = 500_000
+    _SPEED_WARMUP_TIMEOUT = 15
+    # Échantillons : 2 Mo, la taille sur laquelle le seuil circuit_min_kbs est
+    # calibré.  NE PAS RÉDUIRE : chaque curl ouvre une connexion TCP neuve, si
+    # bien qu'un échantillon court passe l'essentiel de sa vie en slow-start et
+    # sous-estime massivement le débit.  Mesuré sur ce déploiement, après
+    # échauffement, sur le même circuit :
+    #     500 Ko →  383 KB/s      2 Mo → 1061 KB/s
+    #       1 Mo →  652 KB/s      5 Mo → 1520 KB/s
+    # Descendre à 500 Ko diviserait la mesure par ~2,8 et ferait rejeter des
+    # circuits sains — exactement le défaut que ce correctif vise à supprimer.
+    _SPEED_BYTES   = 2_000_000
+    _SPEED_SAMPLES = 2
+    _SPEED_TIMEOUT = 30
+    _SPEED_WAIT    = 5         # stabilisation du tunnel avant la mesure
+    _SPEED_RETRY   = 5         # attente avant la seconde salve
+    # Plafond de durée TOTALE du contrôle.  Sans lui, 2 salves × 4 requêtes à
+    # 20 s valent 165 s dans le pire cas, contre 40 s pour la version à une
+    # seule requête : un circuit pathologique ferait durer le contrôle plus
+    # longtemps que la reconnexion qu'il est censé décider.
+    _SPEED_BUDGET  = 75
 
-    def _measure_tunnel_speed(self, iface: str = "", timeout: int = 40) -> float:
-        """Débit descendant mesuré À TRAVERS le tunnel, en KB/s (-1 si échec).
-
-        La mesure crée elle-même la demande qu'elle mesure : contrairement à
-        une lecture passive des compteurs, un résultat faible signifie bien
-        « le lien est lent » et non « rien n'est demandé ».
+    def _fetch_speed(self, iface: str, nbytes: int, timeout: int) -> float:
+        """Une requête : débit descendant en KB/s, -1 si elle n'aboutit pas.
 
         « --interface » lie la requête au tunnel : si celui-ci tombe pendant
         la mesure, curl échoue au lieu de basculer sur la route par défaut —
         ce qui fausserait le résultat et enverrait la requête hors Tor."""
-        url = self._SPEED_URL.format(n=self._SPEED_BYTES)
         cmd = ["curl", "-s", "-o", "/dev/null", "-w", "%{speed_download}",
                "--max-time", str(timeout)]
         if iface:
             cmd += ["--interface", iface]
         try:
             r = subprocess.run(
-                cmd + [url],
+                cmd + [self._SPEED_URL.format(n=nbytes)],
                 capture_output=True, text=True, timeout=timeout + 10)
             bps = float(r.stdout.strip() or 0)
             return bps / 1024 if bps > 0 else -1.0
         except Exception:
             return -1.0
+
+    def _measure_tunnel_speed(self, iface: str = "", still_valid=None) -> float:
+        """Capacité descendante du tunnel en KB/s (-1 si aucune mesure).
+
+        La mesure crée elle-même la demande qu'elle mesure : contrairement à
+        une lecture passive des compteurs, un résultat faible signifie bien
+        « le lien est lent » et non « rien n'est demandé ».
+
+        Trois choix, tous dictés par des mesures :
+
+        1. UNE REQUÊTE D'ÉCHAUFFEMENT, dont le résultat est jeté.  La première
+           requête paie l'ouverture d'un flux TCP/TLS à travers Tor et la
+           montée de la fenêtre de congestion.  Relevé sur un circuit vieux de
+           9 h : 344 KB/s au premier essai, 985 et 979 aux suivants.  Sans
+           échauffement, on mesure le coût d'établissement, pas la capacité.
+
+        2. LE MAXIMUM, pas la moyenne.  La question posée est « ce circuit
+           peut-il aller assez vite ? ».  Un bon échantillon prouve la
+           capacité ; la contention ne tire les mesures que vers le bas, si
+           bien qu'une moyenne pénaliserait un circuit correct momentanément
+           gêné.  Sur 344/985/979, la moyenne dirait 769 pour une capacité
+           réelle de ~985.
+
+        3. DES ÉCHANTILLONS DE 2 Mo, inchangés.  L'échauffement seul est
+           réduit à 500 Ko.  Un échantillon court sous-estime le débit (voir
+           le tableau au-dessus de _SPEED_BYTES) et le seuil circuit_min_kbs
+           est calibré sur 2 Mo.
+
+        Le plancher de mesure passe de 51 à 67 KB/s (2 Mo en 30 s au lieu de
+        40).  C'est le prix du budget de durée ; en dessous, un circuit est de
+        toute façon inutilisable pour un tunnel VPN.
+
+        Empreinte réseau : 500 Ko + 2 × 2 Mo = 4,5 Mo par contrôle, contre
+        2 Mo auparavant.  Le contrôle n'a lieu qu'une fois par tunnel monté.
+
+        `still_valid` est un prédicat consulté entre les requêtes : la mesure
+        en enchaîne désormais plusieurs, elle doit s'interrompre dès que le
+        tunnel disparaît au lieu de continuer à sonder une interface morte."""
+        fin = time.time() + self._SPEED_BUDGET
+
+        def peut_continuer():
+            if still_valid is not None and not still_valid():
+                return False
+            return time.time() < fin
+
+        for salve in (1, 2):
+            if not peut_continuer():
+                break
+            # Échauffement : résultat volontairement ignoré.
+            self._fetch_speed(iface, self._SPEED_WARMUP_BYTES,
+                              self._SPEED_WARMUP_TIMEOUT)
+            mesures = []
+            for _ in range(self._SPEED_SAMPLES):
+                if not peut_continuer():
+                    break
+                kbs = self._fetch_speed(iface, self._SPEED_BYTES,
+                                        self._SPEED_TIMEOUT)
+                if kbs > 0:
+                    mesures.append(kbs)
+            if mesures:
+                return max(mesures)
+            if salve == 1 and peut_continuer():
+                # Cas typique : la salve part trop tôt après un NEWNYM, avant
+                # que le circuit soit utilisable.  Une seconde tentative, pas
+                # une boucle.
+                self._log("[circuit] Aucun échantillon exploitable — "
+                          "seconde salve …", "WARN")
+                time.sleep(self._SPEED_RETRY)
+        return -1.0
 
     def _circuit_quality_check(self):
         """Contrôle qualité UNIQUE, juste après l'établissement du tunnel.
@@ -257,19 +342,25 @@ class OpenVPNMixin:
         if not self._tunnel_up or self._stop_vpn or self._stop_flag:
             return
 
-        # Processus et interface capturés AVANT la mesure : celle-ci dure
-        # jusqu'à ~50 s, pendant lesquelles le tunnel peut tomber et être
+        # Processus et interface capturés AVANT la mesure : celle-ci enchaîne
+        # plusieurs requêtes, pendant lesquelles le tunnel peut tomber et être
         # remplacé par un autre.
         proc = self.openvpn_process
         tun  = self._tun_iface
 
-        kbs = self._measure_tunnel_speed(tun)
+        def tunnel_intact():
+            return (proc is self.openvpn_process and self._tunnel_up
+                    and not self._stop_vpn and not self._stop_flag)
 
-        # Le résultat ne vaut que pour le tunnel mesuré.  Sans ce contrôle,
-        # un thread périmé interpréterait le débit d'un tunnel disparu et,
-        # pire, tuerait le processus qui a pris sa place.
-        if (proc is not self.openvpn_process or not self._tunnel_up
-                or self._stop_vpn or self._stop_flag):
+        # Contrôle PENDANT la mesure : inutile de continuer à sonder une
+        # interface morte pendant plusieurs requêtes.
+        kbs = self._measure_tunnel_speed(tun, still_valid=tunnel_intact)
+
+        # Et contrôle APRÈS : le tunnel peut tomber entre la dernière requête
+        # et l'exploitation du résultat.  Sans ce second contrôle, un thread
+        # périmé interpréterait le débit d'un tunnel disparu et, pire, tuerait
+        # le processus qui a pris sa place.
+        if not tunnel_intact():
             self._log("[circuit] Tunnel renouvelé pendant la mesure — "
                       "résultat ignoré.", "WARN")
             return

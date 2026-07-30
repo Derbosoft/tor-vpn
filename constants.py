@@ -1,6 +1,6 @@
 from pathlib import Path
 
-VERSION       = "3.6.2"
+VERSION       = "3.6.3"
 SCRIPT_DIR    = Path(__file__).resolve().parent
 PROVIDERS_DIR = SCRIPT_DIR / "providers"
 CONFIG_DIR    = Path("/etc/tor-vpn-manager")

@@ -253,16 +253,35 @@ for ligne in sortie.splitlines():
     label, sep, val = ligne.partition(":")
     if sep:
         attrs[label.strip()] = val.strip()
+# default-route : le format varie selon la version de systemd.  Le drapeau de
+# « Protocols » est présent partout ; l'étiquette « Default Route » n'existe
+# pas sur systemd 255.  None = format non reconnu, on ne conclut pas.
+def etat_default_route(attrs):
+    proto = attrs.get("Protocols", "")
+    if "+DefaultRoute" in proto:
+        return True
+    if "-DefaultRoute" in proto:
+        return False
+    for label in ("Default Route", "DefaultRoute setting"):
+        if label in attrs:
+            return attrs[label].strip().lower() in ("yes", "true")
+    return None
+
+route_dns = etat_default_route(attrs)
 manquants = []
 if not attrs.get("DNS Servers"):
     manquants.append("serveur")
 if "~." not in attrs.get("DNS Domain", "").split():
     manquants.append("domaine ~.")
-if attrs.get("Default Route") != "yes":
+if route_dns is False:
     manquants.append("default-route")
 if manquants:
     note(KO, "DNS du tunnel", f"incomplet ({', '.join(manquants)}) — "
                               "risque de requêtes hors tunnel")
+elif route_dns is None:
+    note(WARN, "DNS du tunnel",
+         f"{attrs.get('DNS Servers','?')} · ~. — default-route non vérifiable "
+         "(format resolvectl inconnu)")
 else:
     note(OK, "DNS du tunnel", f"{attrs['DNS Servers']} · ~. · default-route")
 

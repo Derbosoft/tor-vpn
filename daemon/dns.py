@@ -47,6 +47,36 @@ class DNSMixin:
                 info[label.strip()] = val.strip()
         return info
 
+    @staticmethod
+    def _default_route_state(info: dict):
+        """default-route de l'interface : True, False, ou None si illisible.
+
+        Le format varie selon la version de systemd, et les deux formes
+        coexistent sur les versions récentes :
+
+          systemd 259  Protocols: +DefaultRoute -LLMNR …
+                       Default Route: yes
+          systemd 255  Protocols: +DefaultRoute -LLMNR …
+                       (pas d'étiquette « Default Route »)
+
+        On lit donc le drapeau de « Protocols » en premier — c'est la forme
+        présente partout — et l'étiquette ne sert que de repli.
+
+        Le troisième état compte autant que les deux autres : renvoyer False
+        quand on n'a pas su lire ferait conclure à tort que le réglage manque,
+        et le daemon réappliquerait le DNS à chaque tick du watchdog.
+        L'appelant doit tester « is False », jamais « not ... »."""
+        proto = info.get("Protocols", "")
+        if "+DefaultRoute" in proto:
+            return True
+        if "-DefaultRoute" in proto:
+            return False
+        # Replis : étiquette dédiée, sous ses deux orthographes connues.
+        for label in ("Default Route", "DefaultRoute setting"):
+            if label in info:
+                return info[label].strip().lower() in ("yes", "true")
+        return None
+
     def _ensure_dns_config(self):
         """Réapplique le DNS s'il a disparu (ex. systemd-resolved redémarré
         par un autre outil).  Appelé périodiquement par le watchdog quand le
@@ -76,7 +106,11 @@ class DNSMixin:
                     missing.append("serveur")
                 if "~." not in st.get("DNS Domain", "").split():
                     missing.append("domaine ~.")
-                if st.get("Default Route", "") != "yes":
+                # « is False » et non « not ... » : sur None (format de
+                # resolvectl non reconnu) on s'abstient.  Conclure à l'absence
+                # déclencherait une réapplication du DNS à chaque tick du
+                # watchdog, indéfiniment, sur une configuration saine.
+                if self._default_route_state(st) is False:
                     missing.append("default-route")
             if missing:
                 self._log(

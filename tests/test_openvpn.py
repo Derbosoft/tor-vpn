@@ -145,6 +145,163 @@ class CheckOvpnScriptsTest(unittest.TestCase):
         self.assertEqual(d.logs, [], d.log_dump())
 
 
+class SequenceCurl:
+    """Répond à chaque appel curl par la valeur suivante d'une séquence.
+
+    Le Recorder rend toujours la même réponse pour un motif donné : il ne peut
+    pas exprimer « la 1re requête est lente, les suivantes sont rapides », qui
+    est précisément le comportement à tester."""
+
+    def __init__(self, valeurs):
+        self.valeurs = list(valeurs)
+        self.calls = []
+
+    def __call__(self, *cmd, **kwargs):
+        argv = list(cmd[0]) if len(cmd) == 1 and isinstance(cmd[0], (list, tuple)) else list(cmd)
+        self.calls.append(" ".join(str(c) for c in argv))
+        v = self.valeurs.pop(0) if self.valeurs else 0
+        from tests.helpers import Result
+        r = Result(0, str(v))
+        r.text = bool(kwargs.get("text"))
+        return r
+
+    def n_curl(self):
+        return len([c for c in self.calls if c.startswith("curl")])
+
+
+class MeasureWarmupTest(unittest.TestCase):
+    """La mesure décrit la capacité du circuit, pas le coût de la 1re requête.
+
+    Relevé sur un circuit vieux de 9 h, mesure du daemon rejouée 3 fois :
+    344 KB/s, puis 985, puis 979.  Le premier échantillon coûte l'ouverture
+    d'un flux TCP/TLS à travers Tor — il ne dit rien de la capacité."""
+
+    def _mesure(self, octets_par_sec, still_valid=None):
+        d = FakeDaemon()
+        seq = SequenceCurl(octets_par_sec)
+        with patched_subprocess(m_openvpn, seq), no_sleep(m_openvpn):
+            kbs = d._measure_tunnel_speed("tun0", still_valid=still_valid)
+        return kbs, seq, d
+
+    def test_echauffement_effectue(self):
+        """1 échauffement + _SPEED_SAMPLES échantillons."""
+        M = m_openvpn.OpenVPNMixin
+        _, seq, _ = self._mesure([100_000] * (M._SPEED_SAMPLES + 1))
+        self.assertEqual(seq.n_curl(), M._SPEED_SAMPLES + 1,
+                         f"requêtes : {seq.calls}")
+
+    def test_echauffement_plus_petit_que_les_echantillons(self):
+        """Son rôle est d'ouvrir le circuit, pas de mesurer : il doit être bon
+        marché.  Les échantillons, eux, restent à la taille de calibration."""
+        M = m_openvpn.OpenVPNMixin
+        self.assertLess(M._SPEED_WARMUP_BYTES, M._SPEED_BYTES)
+
+    def test_taille_d_echantillon_non_reduite(self):
+        """Un échantillon court passe sa vie en slow-start et sous-estime.
+
+        Mesuré après échauffement sur le même circuit : 500 Ko → 383 KB/s,
+        2 Mo → 1061 KB/s.  Le seuil circuit_min_kbs est calibré sur 2 Mo ;
+        réduire l'échantillon ferait rejeter des circuits sains."""
+        self.assertGreaterEqual(m_openvpn.OpenVPNMixin._SPEED_BYTES, 2_000_000,
+                                "échantillon réduit : la mesure sous-estimera")
+
+    def test_echauffement_et_echantillons_de_tailles_distinctes(self):
+        M = m_openvpn.OpenVPNMixin
+        _, seq, _ = self._mesure([100_000] * (M._SPEED_SAMPLES + 1))
+        curls = [c for c in seq.calls if c.startswith("curl")]
+        self.assertIn(f"bytes={M._SPEED_WARMUP_BYTES}", curls[0])
+        for c in curls[1:]:
+            self.assertIn(f"bytes={M._SPEED_BYTES}", c)
+
+    def test_resultat_de_l_echauffement_jete(self):
+        """Le cas réel : 1re requête lente, suivantes rapides."""
+        kbs, _, _ = self._mesure([344 * 1024, 985 * 1024, 979 * 1024])
+        self.assertAlmostEqual(kbs, 985.0, places=0,
+                               msg="l'échauffement a été compté dans le résultat")
+
+    def test_maximum_retenu_et_non_moyenne(self):
+        kbs, _, _ = self._mesure([1, 344 * 1024, 985 * 1024])
+        self.assertAlmostEqual(kbs, 985.0, places=0)
+        self.assertNotAlmostEqual(kbs, (344 + 985) / 2, places=0,
+                                  msg="une moyenne pénaliserait un circuit gêné")
+
+    def test_empreinte_reseau_bornee(self):
+        """Le contrôle n'a lieu qu'une fois par tunnel, mais reste borné."""
+        M = m_openvpn.OpenVPNMixin
+        total = M._SPEED_WARMUP_BYTES + M._SPEED_BYTES * M._SPEED_SAMPLES
+        self.assertLessEqual(total, 5_000_000,
+                             f"{total} octets par contrôle — empreinte excessive")
+
+    def test_seconde_salve_si_tous_les_echantillons_echouent(self):
+        M = m_openvpn.OpenVPNMixin
+        par_salve = M._SPEED_SAMPLES + 1
+        # 1re salve entièrement en échec, 2e exploitable.
+        kbs, seq, d = self._mesure([0] * par_salve + [1, 500 * 1024, 400 * 1024])
+        self.assertEqual(seq.n_curl(), par_salve * 2, f"requêtes : {seq.calls}")
+        self.assertAlmostEqual(kbs, 500.0, places=0)
+        self.assertTrue(d.has_log("seconde salve", "WARN"), d.log_dump())
+
+    def test_deux_salves_au_maximum(self):
+        """Jamais de boucle : deux salves puis abandon."""
+        M = m_openvpn.OpenVPNMixin
+        kbs, seq, _ = self._mesure([0] * 20)
+        self.assertEqual(kbs, -1.0)
+        self.assertEqual(seq.n_curl(), (M._SPEED_SAMPLES + 1) * 2,
+                         "plus de deux salves")
+
+    def test_interruption_si_le_tunnel_disparait(self):
+        """Inutile de sonder une interface morte pendant plusieurs requêtes."""
+        etat = {"vivant": True}
+
+        def still_valid():
+            # Vivant pour l'échauffement, mort ensuite.
+            v = etat["vivant"]
+            etat["vivant"] = False
+            return v
+
+        kbs, seq, _ = self._mesure([500 * 1024] * 12, still_valid=still_valid)
+        self.assertEqual(kbs, -1.0)
+        self.assertLessEqual(seq.n_curl(), 2,
+                             f"a continué à sonder : {seq.calls}")
+
+    def test_budget_total_borne(self):
+        """Le contrôle ne doit pas durer plus que la reconnexion qu'il décide."""
+        M = m_openvpn.OpenVPNMixin
+        pire = 2 * (M._SPEED_SAMPLES + 1) * M._SPEED_TIMEOUT + M._SPEED_RETRY
+        self.assertGreater(pire, M._SPEED_BUDGET,
+                           "le budget ne sert à rien s'il dépasse le pire cas")
+        self.assertLessEqual(M._SPEED_BUDGET, 90,
+                             f"budget de {M._SPEED_BUDGET}s trop permissif")
+
+    def test_budget_epuise_interrompt(self):
+        """Requêtes lentes : on s'arrête au budget, pas au nombre de salves."""
+        d = FakeDaemon()
+        seq = SequenceCurl([0] * 20)
+        vrai = m_openvpn.time.time
+        horloge = {"t": vrai()}
+        # Chaque requête « coûte » 30 s d'horloge : le budget saute vite.
+        def faux_temps():
+            return horloge["t"]
+        def avance(*a, **k):
+            horloge["t"] += 30
+            return seq(*a, **k)
+        m_openvpn.time.time = faux_temps
+        try:
+            with patched_subprocess(m_openvpn, avance), no_sleep(m_openvpn):
+                kbs = d._measure_tunnel_speed("tun0")
+        finally:
+            m_openvpn.time.time = vrai
+        self.assertEqual(kbs, -1.0)
+        M = m_openvpn.OpenVPNMixin
+        self.assertLess(seq.n_curl(), (M._SPEED_SAMPLES + 1) * 2,
+                        f"le budget n'a pas interrompu : {seq.n_curl()} requêtes")
+
+    def test_aucune_requete_si_deja_invalide(self):
+        kbs, seq, _ = self._mesure([500 * 1024] * 12, still_valid=lambda: False)
+        self.assertEqual(kbs, -1.0)
+        self.assertEqual(seq.n_curl(), 0)
+
+
 class MeasureSpeedTest(unittest.TestCase):
     """Correctif #3 : la mesure doit être liée à l'interface tunnel."""
 
@@ -153,10 +310,10 @@ class MeasureSpeedTest(unittest.TestCase):
         if exc:
             def boom(*a, **k):
                 raise exc
-            with patched_subprocess(m_openvpn, boom):
+            with patched_subprocess(m_openvpn, boom), no_sleep(m_openvpn):
                 return d._measure_tunnel_speed(iface), None
         rec = Recorder({"curl": (rc, out)})
-        with patched_subprocess(m_openvpn, rec):
+        with patched_subprocess(m_openvpn, rec), no_sleep(m_openvpn):
             return d._measure_tunnel_speed(iface), rec
 
     def test_interface_transmise_a_curl(self):
@@ -174,7 +331,7 @@ class MeasureSpeedTest(unittest.TestCase):
 
     def test_max_time_present(self):
         _, rec = self._measure()
-        self.assertTrue(rec.ran("--max-time 40"))
+        self.assertTrue(rec.ran(f"--max-time {m_openvpn.OpenVPNMixin._SPEED_TIMEOUT}"))
 
     def test_debit_nul_renvoie_moins_un(self):
         self.assertEqual(self._measure(out="0")[0], -1.0)
@@ -198,7 +355,7 @@ class CircuitQualityTest(unittest.TestCase):
         d._tunnel_up, d._tun_iface = True, "tun0"
         d.openvpn_process = FakeProc(returncode=None)
         d.openvpn_process._rc = None                       # vivant
-        d._measure_tunnel_speed = lambda iface="", timeout=40: kbs
+        d._measure_tunnel_speed = lambda iface="", still_valid=None: kbs
         d.newnym = []
         d._new_tor_circuit = lambda: d.newnym.append(1)
         return d
@@ -271,7 +428,7 @@ class CircuitQualityTest(unittest.TestCase):
         nouveau = FakeProc(returncode=None)
         nouveau._rc = None
 
-        def mesure_puis_remplacement(iface="", timeout=40):
+        def mesure_puis_remplacement(iface="", still_valid=None):
             d.openvpn_process = nouveau          # reconnexion pendant la mesure
             return 50.0
 
@@ -286,7 +443,7 @@ class CircuitQualityTest(unittest.TestCase):
     def test_tunnel_tombe_pendant_la_mesure(self):
         d = self._daemon(50.0)
 
-        def mesure_puis_chute(iface="", timeout=40):
+        def mesure_puis_chute(iface="", still_valid=None):
             d._tunnel_up = False
             return 50.0
 
@@ -298,7 +455,7 @@ class CircuitQualityTest(unittest.TestCase):
     def test_interface_capturee_avant_la_mesure(self):
         d = self._daemon(400.0)
         vues = []
-        d._measure_tunnel_speed = lambda iface="", timeout=40: (vues.append(iface), 400.0)[1]
+        d._measure_tunnel_speed = lambda iface="", still_valid=None: (vues.append(iface), 400.0)[1]
         self._run(d)
         self.assertEqual(vues, ["tun0"])
 
@@ -784,7 +941,7 @@ class LastCircuitMeasureTest(unittest.TestCase):
         d._tunnel_up, d._tun_iface = True, "tun0"
         d.openvpn_process = FakeProc(returncode=None)
         d.openvpn_process._rc = None
-        d._measure_tunnel_speed = lambda iface="", timeout=40: kbs
+        d._measure_tunnel_speed = lambda iface="", still_valid=None: kbs
         d._new_tor_circuit = lambda: None
         return d
 

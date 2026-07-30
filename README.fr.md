@@ -1,9 +1,9 @@
-# Tor-VPN Manager — v3.6.2
+# Tor-VPN Manager — v3.6.3
 
 ![Python](https://img.shields.io/badge/Python-3.8+-blue?logo=python)
 ![Platform](https://img.shields.io/badge/Platform-Ubuntu%20%7C%20Debian-orange?logo=linux)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Version](https://img.shields.io/badge/Version-3.6.2-blue)
+![Version](https://img.shields.io/badge/Version-3.6.3-blue)
 ![Systemd](https://img.shields.io/badge/Systemd-service-lightgrey?logo=linux)
 
 > [English documentation](README.md)
@@ -99,6 +99,14 @@ L'installateur effectue **6 étapes** :
 apt install tor openvpn python3 python3-tk curl
 ```
 `dnsmasq` ne sert qu'au partage LAN (désactivé par défaut) : depuis la v3.6.1 il n'est installé que s'il est déjà présent ou si le partage est configuré, plutôt qu'installé puis désactivé aussitôt. Pour l'ajouter plus tard : `sudo apt install dnsmasq`.
+
+> **`TORVPN_SKIP_APT=1` — rejouer l'installeur sans réseau (v3.6.3).** Utile quand seule l'unité systemd ou le CLI a changé sur une machine déjà installée, d'autant que le seul chemin réseau disponible peut être le tunnel que ce daemon est justement en train de monter.
+>
+> ```bash
+> sudo TORVPN_SKIP_APT=1 bash install.sh
+> ```
+>
+> Le garde n'est pas une simple dérogation : il **vérifie que toutes les dépendances sont présentes** (`tor`, `openvpn`, `python3`, `curl`, `tkinter`) et **refuse de continuer** sinon. Sauter `apt` sur une machine incomplète produirait une installation à moitié fonctionnelle, plus difficile à diagnostiquer qu'un échec franc.
 
 **2. Répertoire de configuration**
 - Crée `/etc/tor-vpn-manager/` en `root:torvpn 2770` (groupe torvpn : GUI sans root)
@@ -345,7 +353,7 @@ Vérifie en une commande les invariants qui doivent tenir quand la connexion est
 
 ```
   [OK  ] Service                    actif
-  [OK  ] Version du daemon          3.6.2
+  [OK  ] Version du daemon          3.6.3
   [OK  ] Tor                        bootstrap terminé
   [OK  ] Tunnel                     tun0 depuis 17h27 (ivpn, compte 1)
   [OK  ] Qualité du circuit         592 KB/s (~4.7 Mbps), mesuré il y a 0h03
@@ -438,7 +446,11 @@ Le DNS du VPN est géré nativement par le daemon : les serveurs poussés par le
 - Au démarrage, le daemon vérifie que `resolvectl` est présent et que `systemd-resolved` est actif — sinon il avertit clairement dans le journal (sans lui, la résolution DNS peut échouer ou fuir hors Tor).
 - Toutes les ~30 s, il **revérifie** que la configuration DNS de l'interface tunnel est toujours en place. Si un outil tiers a redémarré `systemd-resolved` (ce qui efface la config *runtime* par interface), elle est **réappliquée automatiquement**. En temps normal c'est une simple lecture : aucune réécriture, aucun `reload` inutile.
 
-  Depuis la v3.6.1, le contrôle porte sur les **trois** attributs posés (serveurs DNS, domaine `~.`, `default-route`) et non plus sur les seuls serveurs. Motif : lors d'une reconnexion interne (`SIGUSR1`), le hook natif `dns-updown` d'OpenVPN 2.6+ réinstalle les serveurs mais pas nécessairement le reste — et sans `~.`, l'interface tunnel cesse d'être la destination DNS par défaut, si bien que les requêtes publiques peuvent repartir vers le DNS local, hors tunnel, sans que rien ne le signale.
+  Depuis la v3.6.1, le contrôle porte sur les **trois** attributs posés (serveurs DNS, domaine `~.`, `default-route`) et non plus sur les seuls serveurs.
+
+  **v3.6.3 — lecture du `default-route` à trois états.** Le format de `resolvectl status` varie selon la version de systemd : le drapeau `+DefaultRoute` de la ligne `Protocols` est présent partout, mais l'étiquette `Default Route: yes` **n'existe pas sur systemd 255** (Ubuntu 24.04). Le daemon ne lisait que l'étiquette : il en concluait que le réglage manquait et **réappliquait le DNS à chaque tick du watchdog** — 19 fois en 10 minutes sur une configuration saine, avec un `WARN` à chaque passage, et un `[KO]` permanent dans `doctor`.
+
+  La lecture renvoie désormais **trois** états : posé, retiré, ou `None` quand aucune des deux formes n'est reconnue. L'appelant teste `is False` et non `not …` : sur `None` il **s'abstient** au lieu de conclure à l'absence. C'est cette distinction qui empêche la boucle de revenir si le format change encore ; `doctor` rend alors un `WARN` explicite plutôt qu'un `KO`. Motif : lors d'une reconnexion interne (`SIGUSR1`), le hook natif `dns-updown` d'OpenVPN 2.6+ réinstalle les serveurs mais pas nécessairement le reste — et sans `~.`, l'interface tunnel cesse d'être la destination DNS par défaut, si bien que les requêtes publiques peuvent repartir vers le DNS local, hors tunnel, sans que rien ne le signale.
 
 **Séquence à la connexion :**
 Quand `Initialization Sequence Completed` est détecté :
@@ -543,7 +555,7 @@ Si **3 redémarrages complets consécutifs** échouent tous (compteur `_full_res
 
 ### Contrôle qualité du circuit Tor
 
-Le circuit Tor est **tiré au sort à chaque connexion** : sa qualité varie fortement d'un tirage à l'autre (de ~100 KB/s à plusieurs Mo/s). Juste après l'établissement du tunnel, le daemon effectue **une mesure unique** du débit réel (téléchargement de 2 Mo *à travers* le tunnel) :
+Le circuit Tor est **tiré au sort à chaque connexion** : sa qualité varie fortement d'un tirage à l'autre (de ~100 KB/s à plusieurs Mo/s). Juste après l'établissement du tunnel, le daemon mesure le débit réel *à travers* le tunnel :
 
 ```
 Tunnel actif → 5 s de stabilisation → mesure du débit
@@ -560,6 +572,42 @@ Deux points de conception importants :
 - **`NEWNYM` est envoyé *avant* la reconnexion.** Il ne change pas le circuit d'une connexion déjà établie — il garantit que la *prochaine* connexion partira sur un circuit neuf. Sans lui, `MaxCircuitDirtiness` ferait réutiliser le même circuit, donc les mêmes relais lents.
 
 **Aucune surveillance continue** : ce test ne tourne pas en tâche de fond et ne consomme rien après la connexion.
+
+#### Comment la mesure est prise (v3.6.3)
+
+Une requête unique mesurait le **coût d'établissement de la connexion**, pas la capacité du circuit. Relevé sur ce déploiement, mesure du daemon rejouée trois fois de suite sur un circuit vieux de 9 h :
+
+```
+essai 1 : 344 KB/s        ← ouverture du flux TCP/TLS à travers Tor
+essai 2 : 985 KB/s
+essai 3 : 979 KB/s
+```
+
+Le premier échantillon est 2,9 × plus bas — sur un circuit parfaitement mûr. Des circuits sains étaient donc rejetés, et le démarrage s'allongeait de plusieurs minutes en re-tirages inutiles.
+
+La mesure procède désormais ainsi :
+
+1. **Une requête d'échauffement de 500 Ko, dont le résultat est jeté.** Elle ouvre la fenêtre de contrôle de flux du circuit Tor.
+2. **Deux échantillons de 2 Mo**, dont on retient le **maximum**.
+
+Trois choix méritent d'être explicités :
+
+- **Le maximum, pas la moyenne.** La question posée est « ce circuit peut-il aller assez vite ? ». Un bon échantillon prouve la capacité ; la contention ne tire les mesures que vers le bas, si bien qu'une moyenne pénaliserait un circuit correct momentanément gêné.
+- **Les échantillons restent à 2 Mo.** C'est contre-intuitif, mais **les réduire fausserait la mesure** : chaque `curl` ouvre une connexion TCP neuve, et un transfert court passe l'essentiel de sa vie en *slow-start*. Mesuré ici, après échauffement, sur le même circuit :
+
+  | Échantillon | Débit mesuré |
+  |---|---|
+  | 500 Ko | 383 KB/s |
+  | 1 Mo | 652 KB/s |
+  | 2 Mo | 1061 KB/s |
+  | 5 Mo | 1520 KB/s |
+
+  Descendre à 500 Ko diviserait la mesure par ~2,8 et ferait rejeter des circuits sains — exactement le défaut corrigé. Le seuil `circuit_min_kbs` est calibré sur 2 Mo.
+- **Un budget de durée total** (`_SPEED_BUDGET`, 75 s) borne l'ensemble. Sans lui, deux salves de requêtes lentes atteindraient 165 s : le contrôle durerait plus longtemps que la reconnexion qu'il est censé décider.
+
+Empreinte réseau : **4,5 Mo par tunnel monté** (500 Ko + 2 × 2 Mo), contre 2 Mo auparavant. Le contrôle n'a lieu qu'une fois par connexion.
+
+Résultat mesuré, même tunnel : **981 et 982 KB/s en 5,3 s**, là où la mesure à froid donnait 456 KB/s.
 
 Exemple réel :
 ```

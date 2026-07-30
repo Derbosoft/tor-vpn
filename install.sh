@@ -32,8 +32,35 @@ fi
 
 # ── [1/6] Dépendances ────────────────────────────────────────────────────────
 echo "[1/6] Installation des dépendances …"
-apt-get update -qq
-apt-get install -y tor openvpn python3 python3-tk curl
+
+# TORVPN_SKIP_APT=1 : rejouer l'installeur sans réseau.  C'est le besoin réel
+# quand seule l'unité systemd ou le CLI a changé sur une machine déjà
+# installée — d'autant que le seul chemin réseau disponible peut être le
+# tunnel que ce daemon est justement en train de monter.
+#
+# Le garde n'est pas une simple dérogation : il VÉRIFIE que tout est déjà là
+# et refuse sinon.  Sauter apt sur une machine incomplète produirait une
+# installation à moitié fonctionnelle, plus difficile à diagnostiquer qu'un
+# échec franc.
+DEPS_BIN=(tor openvpn python3 curl)
+if [ "${TORVPN_SKIP_APT:-0}" = "1" ]; then
+    echo "    TORVPN_SKIP_APT=1 — vérification des dépendances sans apt …"
+    manquants=()
+    for bin in "${DEPS_BIN[@]}"; do
+        command -v "$bin" &>/dev/null || manquants+=("$bin")
+    done
+    python3 -c "import tkinter" 2>/dev/null || manquants+=("python3-tk")
+    if [ ${#manquants[@]} -gt 0 ]; then
+        echo "ERREUR : dépendances absentes : ${manquants[*]}"
+        echo "  TORVPN_SKIP_APT=1 suppose une machine déjà installée."
+        echo "  Relancez sans ce garde, avec un accès réseau."
+        exit 1
+    fi
+    echo "    Toutes les dépendances sont présentes."
+else
+    apt-get update -qq
+    apt-get install -y tor openvpn python3 python3-tk curl
+fi
 
 # dnsmasq ne sert QU'au partage LAN (fonction optionnelle, désactivée par
 # défaut).  On ne l'installe donc pas systématiquement pour le désactiver
@@ -48,7 +75,7 @@ sys.exit(0 if d.get('lan_auto') or d.get('lan_iface') else 1)
 fi
 if command -v dnsmasq &>/dev/null; then
     echo "    dnsmasq déjà présent (partage LAN disponible)"
-elif [ "$LAN_CONFIGURED" = true ]; then
+elif [ "$LAN_CONFIGURED" = true ] && [ "${TORVPN_SKIP_APT:-0}" != "1" ]; then
     echo "    Partage LAN configuré — installation de dnsmasq …"
     apt-get install -y dnsmasq || true
 else
@@ -127,8 +154,12 @@ echo "[3/6] Configuration des services système …"
 
 # Sur Debian 12+, systemd-resolved est un paquet séparé non installé par défaut.
 if ! systemctl list-unit-files systemd-resolved.service --no-legend 2>/dev/null | grep -q systemd-resolved; then
-    echo "    systemd-resolved absent — tentative d'installation …"
-    apt-get install -y systemd-resolved || true
+    if [ "${TORVPN_SKIP_APT:-0}" = "1" ]; then
+        echo "    systemd-resolved absent — non installé (TORVPN_SKIP_APT=1)"
+    else
+        echo "    systemd-resolved absent — tentative d'installation …"
+        apt-get install -y systemd-resolved || true
+    fi
 fi
 systemctl enable systemd-resolved 2>/dev/null || true
 systemctl start  systemd-resolved 2>/dev/null || true

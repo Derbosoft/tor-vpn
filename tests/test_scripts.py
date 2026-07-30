@@ -5,6 +5,7 @@ Lancer install.sh ou repair_network.sh couperait le réseau de la machine.
 """
 
 import re
+import shutil
 import subprocess
 import unittest
 from pathlib import Path
@@ -145,6 +146,30 @@ class InstallServiceUnitTest(unittest.TestCase):
         bloc = INSTALL[INSTALL.index("── Vérification"):]
         self.assertNotRegex(bloc, r"for bin in [^\n]*dnsmasq")
 
+    def test_skip_apt_verifie_avant_de_sauter(self):
+        """Rejouable sans réseau, mais jamais sur une machine incomplète.
+
+        Sauter apt sur une machine à laquelle il manque des paquets produirait
+        une installation à moitié fonctionnelle, plus dure à diagnostiquer
+        qu'un échec franc."""
+        self.assertIn("TORVPN_SKIP_APT", INSTALL)
+        bloc = INSTALL[INSTALL.index("TORVPN_SKIP_APT"):
+                       INSTALL.index("[2/6]")]
+        self.assertIn("command -v", bloc, "aucune vérification des binaires")
+        self.assertIn("import tkinter", bloc, "python3-tk non vérifié")
+        self.assertIn("exit 1", bloc, "n'échoue pas quand une dépendance manque")
+
+    def test_aucun_apt_get_hors_garde(self):
+        """Chaque appel à apt doit être atteignable seulement sans le garde."""
+        for i, ligne in enumerate(INSTALL.splitlines(), 1):
+            if "apt-get" not in ligne or ligne.strip().startswith("#"):
+                continue
+            # Contexte : les 12 lignes précédentes doivent porter le garde.
+            debut = max(0, i - 13)
+            contexte = "\n".join(INSTALL.splitlines()[debut:i])
+            self.assertIn("TORVPN_SKIP_APT", contexte,
+                          f"install.sh:{i} appelle apt hors du garde : {ligne.strip()}")
+
     def test_torrc_par_defaut_non_ecrase(self):
         self.assertIn('if [ ! -f "$TORRC_FILE" ]', INSTALL)
 
@@ -204,18 +229,39 @@ class VersionCoherenceTest(unittest.TestCase):
                              f"--script-security réintroduit dans argv ({litteral})")
 
 
+def _fichiers_suivis():
+    """Fichiers suivis par git, ou None si la question n'a pas de sens ici.
+
+    La suite doit pouvoir tourner sur une machine DÉPLOYÉE après une mise à
+    jour — c'est tout son intérêt.  Or `git` y est souvent absent, et le
+    répertoire d'installation n'est pas un dépôt.  Un test qui plante dans ce
+    cas rend la suite inutilisable là où elle sert le plus."""
+    if not shutil.which("git"):
+        return None
+    r = subprocess.run(["git", "ls-files"], cwd=ROOT,
+                       capture_output=True, text=True)
+    if r.returncode != 0:          # hors dépôt
+        return None
+    return r.stdout.splitlines()
+
+
 class GitignoreTest(unittest.TestCase):
     """Les secrets ne doivent pas pouvoir être committés par accident."""
 
     def test_ignore_les_donnees_personnelles(self):
-        ign = (ROOT / ".gitignore").read_text()
+        ign_path = ROOT / ".gitignore"
+        if not ign_path.exists():
+            self.skipTest("pas de .gitignore (installation déployée)")
+        ign = ign_path.read_text()
         for motif in ("providers/*/", "auth.tmp", "id.txt", "__pycache__/"):
             self.assertIn(motif, ign, f"{motif} n'est pas ignoré")
 
     def test_aucun_ovpn_ni_config_suivi_par_git(self):
-        r = subprocess.run(["git", "ls-files"], cwd=ROOT,
-                           capture_output=True, text=True)
-        suivis = r.stdout.splitlines()
+        """La règle garde tout son sens DANS un dépôt : un .ovpn contient des
+        certificats.  Hors dépôt, elle n'a simplement pas d'objet."""
+        suivis = _fichiers_suivis()
+        if suivis is None:
+            self.skipTest("git absent ou hors dépôt (installation déployée)")
         for f in suivis:
             self.assertFalse(f.startswith("providers/") and f.endswith(".ovpn"),
                              f"fichier .ovpn personnel suivi par git : {f}")

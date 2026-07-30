@@ -8,7 +8,14 @@ import daemon.dns as m_dns
 from tests.helpers import FakeDaemon, Recorder, patched_run, patched_subprocess
 
 
-STATUS_COMPLET = """Link 6 (tun0)
+# Sorties RÉELLES de « resolvectl status tun0 », capturées et non reconstruites.
+#
+# Une version antérieure de ce fichier fabriquait l'échantillon à partir d'un
+# format supposé : la ligne « Protocols » était absente et l'étiquette
+# « Default Route » toujours présente.  Le parseur était donc validé contre un
+# format que resolvectl ne produit pas partout, et le défaut de systemd 255
+# (étiquette absente, drapeau seul) est passé au travers de la suite.
+STATUS_COMPLET = """Link 17 (tun0)
     Current Scopes: DNS
          Protocols: +DefaultRoute -LLMNR -mDNS -DNSOverTLS DNSSEC=no/unsupported
 Current DNS Server: 10.20.20.1
@@ -17,10 +24,35 @@ Current DNS Server: 10.20.20.1
      Default Route: yes
 """
 
+# systemd 255 (Ubuntu 24.04) : le drapeau existe, l'étiquette non.
+STATUS_SANS_ETIQUETTE = """Link 8 (tun0)
+    Current Scopes: DNS
+         Protocols: +DefaultRoute -LLMNR -mDNS -DNSOverTLS DNSSEC=no/unsupported
+Current DNS Server: 10.39.20.1
+       DNS Servers: 10.39.20.1
+        DNS Domain: ~.
+"""
 
-def status(servers="10.20.20.1", domain="~.", route="yes", link="Link 6 (tun0)"):
-    """Construit une sortie « resolvectl status » ; None = ligne absente."""
+# systemd < 249 : ni drapeau dans Protocols, ni « Default Route », mais une
+# étiquette « DefaultRoute setting ».
+STATUS_LEGACY = """Link 8 (tun0)
+      Current Scopes: DNS
+DefaultRoute setting: yes
+         DNS Servers: 10.39.20.1
+          DNS Domain: ~.
+"""
+
+
+def status(servers="10.20.20.1", domain="~.", route="yes", link="Link 6 (tun0)",
+           protocols="+DefaultRoute -LLMNR -mDNS -DNSOverTLS DNSSEC=no/unsupported"):
+    """Construit une sortie « resolvectl status » ; None = ligne absente.
+
+    `route` pilote l'étiquette « Default Route », `protocols` le drapeau —
+    les deux doivent pouvoir être manipulés séparément, puisque les versions
+    de systemd n'émettent pas les mêmes."""
     out = [link, "    Current Scopes: DNS"]
+    if protocols is not None:
+        out.append(f"         Protocols: {protocols}")
     if servers is not None:
         out.append(f"       DNS Servers: {servers}")
     if domain is not None:
@@ -53,6 +85,91 @@ class LinkStatusParsingTest(unittest.TestCase):
     def test_plusieurs_serveurs(self):
         st = self._parse(status(servers="10.1.1.1 10.1.1.2"))
         self.assertEqual(st["DNS Servers"], "10.1.1.1 10.1.1.2")
+
+
+class DefaultRouteStateTest(unittest.TestCase):
+    """Trois états : posé, retiré, illisible.
+
+    Le format de « resolvectl status » varie selon la version de systemd.
+    Confondre « illisible » et « retiré » faisait réappliquer le DNS à chaque
+    tick du watchdog sur une configuration saine — 19 fois en 10 minutes."""
+
+    def _etat(self, sortie):
+        rec = Recorder({"resolvectl status": (0, sortie)})
+        with patched_subprocess(m_dns, rec):
+            info = m_dns.DNSMixin._resolvectl_link_status("tun0")
+        return m_dns.DNSMixin._default_route_state(info)
+
+    def test_drapeau_et_etiquette_presents(self):
+        self.assertIs(self._etat(STATUS_COMPLET), True)
+
+    def test_drapeau_seul_systemd_255(self):
+        """Le cas qui a échappé à la suite : étiquette absente, drapeau posé."""
+        self.assertIs(self._etat(STATUS_SANS_ETIQUETTE), True,
+                      "un drapeau +DefaultRoute sans étiquette doit valoir True")
+
+    def test_drapeau_negatif(self):
+        self.assertIs(self._etat(status(
+            route=None, protocols="-DefaultRoute -LLMNR -mDNS")), False)
+
+    def test_etiquette_ancienne_systemd_248(self):
+        self.assertIs(self._etat(STATUS_LEGACY), True)
+
+    def test_etiquette_ancienne_negative(self):
+        self.assertIs(self._etat(STATUS_LEGACY.replace("setting: yes",
+                                                       "setting: no")), False)
+
+    def test_format_inconnu_renvoie_none(self):
+        """Ni drapeau ni étiquette : on ne sait pas, on ne conclut pas."""
+        self.assertIsNone(self._etat(
+            "Link 8 (tun0)\n    Current Scopes: DNS\n       DNS Servers: 1.1.1.1\n"))
+
+    def test_sortie_vide_renvoie_none(self):
+        self.assertIsNone(self._etat(""))
+
+    def test_drapeau_prioritaire_sur_etiquette(self):
+        """Les deux formes coexistent ; le drapeau est présent partout."""
+        melange = STATUS_COMPLET.replace("Default Route: yes",
+                                         "Default Route: no")
+        self.assertIs(self._etat(melange), True)
+
+    def test_none_ne_declenche_aucune_reapplication(self):
+        """La conséquence qui compte : pas de boucle sur un format inconnu."""
+        sortie = ("Link 8 (tun0)\n    Current Scopes: DNS\n"
+                  "       DNS Servers: 10.20.20.1\n        DNS Domain: ~.\n")
+        d = FakeDaemon()
+        d._tunnel_up, d._vpn_dns_ips, d._tun_iface = True, ["10.20.20.1"], "tun0"
+        applied = []
+        d._apply_vpn_dns = lambda: applied.append("vpn")
+        d._apply_dns_split = lambda: applied.append("split")
+        rec = Recorder({"resolvectl status": (0, sortie)})
+        with patched_subprocess(m_dns, rec):
+            d._ensure_dns_config()
+        self.assertEqual(applied, [],
+                         "réapplication déclenchée sur un default-route illisible")
+
+
+class FixtureRealismTest(unittest.TestCase):
+    """Garde-fou : les échantillons doivent ressembler à la vraie sortie.
+
+    C'est la cause commune des deux défauts remontés — un échantillon
+    reconstruit à partir d'un format supposé valide n'importe quel parseur."""
+
+    def test_echantillons_contiennent_la_ligne_protocols(self):
+        for nom, ech in (("STATUS_COMPLET", STATUS_COMPLET),
+                         ("STATUS_SANS_ETIQUETTE", STATUS_SANS_ETIQUETTE)):
+            self.assertIn("Protocols:", ech,
+                          f"{nom} n'a pas de ligne Protocols — format irréaliste")
+
+    def test_au_moins_un_echantillon_sans_etiquette_default_route(self):
+        """Sans ce cas, le défaut de systemd 255 repasserait inaperçu."""
+        self.assertNotIn("Default Route", STATUS_SANS_ETIQUETTE)
+
+    def test_le_constructeur_permet_les_deux_formes_separement(self):
+        avec = status(route="yes", protocols=None)
+        sans = status(route=None, protocols="+DefaultRoute -LLMNR")
+        self.assertNotIn("Protocols", avec)
+        self.assertNotIn("Default Route", sans)
 
 
 class EnsureDnsConfigTest(unittest.TestCase):
@@ -88,12 +205,16 @@ class EnsureDnsConfigTest(unittest.TestCase):
         self.assertTrue(d.has_log("domaine ~.", "WARN"), d.log_dump())
 
     def test_default_route_desactive_detecte(self):
-        d, applied = self._check(status(route="no"))
+        """Désactivé pour de bon : le drapeau ET l'étiquette disent non."""
+        d, applied = self._check(status(
+            route="no", protocols="-DefaultRoute -LLMNR -mDNS -DNSOverTLS"))
         self.assertEqual(applied, ["vpn"])
         self.assertTrue(d.has_log("default-route", "WARN"))
 
     def test_trois_attributs_absents_listes_ensemble(self):
-        d, applied = self._check(status(servers=None, domain=None, route=None))
+        d, applied = self._check(status(
+            servers=None, domain=None, route=None,
+            protocols="-DefaultRoute -LLMNR -mDNS -DNSOverTLS"))
         self.assertEqual(applied, ["vpn"])
         msg = d.logged("Config DNS")[0][1]
         for attendu in ("serveur", "domaine ~.", "default-route"):

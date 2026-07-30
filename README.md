@@ -1,9 +1,9 @@
-# Tor-VPN Manager — v3.6.2
+# Tor-VPN Manager — v3.6.3
 
 ![Python](https://img.shields.io/badge/Python-3.8+-blue?logo=python)
 ![Platform](https://img.shields.io/badge/Platform-Ubuntu%20%7C%20Debian-orange?logo=linux)
 ![License](https://img.shields.io/badge/License-MIT-green)
-![Version](https://img.shields.io/badge/Version-3.6.2-blue)
+![Version](https://img.shields.io/badge/Version-3.6.3-blue)
 ![Systemd](https://img.shields.io/badge/Systemd-service-lightgrey?logo=linux)
 
 > [Documentation en français](README.fr.md)
@@ -99,6 +99,14 @@ The installer runs **6 steps**:
 apt install tor openvpn python3 python3-tk curl
 ```
 `dnsmasq` is only used by LAN sharing (disabled by default): since v3.6.1 it is installed only if already present or if sharing is configured, rather than installed and immediately disabled. To add it later: `sudo apt install dnsmasq`.
+
+> **`TORVPN_SKIP_APT=1` — replay the installer with no network (v3.6.3).** Useful when only the systemd unit or the CLI changed on an already-installed machine, all the more so when the only available network path is the tunnel this daemon is in the middle of bringing up.
+>
+> ```bash
+> sudo TORVPN_SKIP_APT=1 bash install.sh
+> ```
+>
+> The guard is not a plain override: it **verifies every dependency is present** (`tor`, `openvpn`, `python3`, `curl`, `tkinter`) and **refuses to continue** otherwise. Skipping `apt` on an incomplete machine would produce a half-working install, harder to diagnose than an outright failure.
 
 **2. Configuration directory**
 - Creates `/etc/tor-vpn-manager/` as `root:torvpn 2770` (torvpn group: root-less GUI)
@@ -404,7 +412,11 @@ VPN DNS is handled natively by the daemon: the servers pushed by the VPN (`PUSH_
 - On startup the daemon checks that `resolvectl` exists and `systemd-resolved` is active — otherwise it warns clearly in the journal (without it, DNS resolution may fail or leak outside Tor).
 - Every ~30 s it **re-verifies** that the tunnel interface's DNS config is still in place. If a third-party tool restarted `systemd-resolved` (which wipes the per-interface *runtime* config), it is **re-applied automatically**. In the normal case this is just a read: no rewrite, no needless `reload`.
 
-  Since v3.6.1 the check covers **all three** attributes that were set (DNS servers, `~.` domain, `default-route`) instead of the servers alone. Reason: on an internal reconnect (`SIGUSR1`), OpenVPN 2.6+'s native `dns-updown` hook reinstalls the servers but not necessarily the rest — and without `~.` the tunnel interface stops being the default DNS destination, so public queries can go back out to the local DNS, outside the tunnel, with nothing to signal it.
+  Since v3.6.1 the check covers **all three** attributes that were set (DNS servers, `~.` domain, `default-route`) instead of the servers alone.
+
+  **v3.6.3 — three-state `default-route` reading.** The `resolvectl status` format varies with the systemd version: the `+DefaultRoute` flag on the `Protocols` line is present everywhere, but the `Default Route: yes` label **does not exist on systemd 255** (Ubuntu 24.04). The daemon only read the label, concluded the setting was missing and **reapplied DNS on every watchdog tick** — 19 times in 10 minutes on a healthy setup, with a `WARN` each time and a permanent `[KO]` in `doctor`.
+
+  The reader now returns **three** states: set, cleared, or `None` when neither form is recognised. The caller tests `is False`, not `not …`: on `None` it **abstains** instead of concluding absence. That distinction is what stops the loop from returning if the format changes again; `doctor` then reports an explicit `WARN` rather than a `KO`. Reason: on an internal reconnect (`SIGUSR1`), OpenVPN 2.6+'s native `dns-updown` hook reinstalls the servers but not necessarily the rest — and without `~.` the tunnel interface stops being the default DNS destination, so public queries can go back out to the local DNS, outside the tunnel, with nothing to signal it.
 
 **Connection sequence:**
 When `Initialization Sequence Completed` is detected:
@@ -509,7 +521,7 @@ If **3 consecutive full restarts** all fail (`_full_restart_count`), the watchdo
 
 ### Tor circuit quality check
 
-The Tor circuit is **drawn at random on every connection**, and its quality varies wildly (from ~100 KB/s to several MB/s). Right after the tunnel comes up, the daemon runs **a single measurement** of real throughput (a 2 MB download *through* the tunnel):
+The Tor circuit is **drawn at random on every connection**, and its quality varies wildly (from ~100 KB/s to several MB/s). Right after the tunnel comes up, the daemon measures real throughput *through* the tunnel:
 
 ```
 Tunnel up → 5 s to settle → measure throughput
@@ -526,6 +538,42 @@ Two design points worth stating:
 - **`NEWNYM` is sent *before* reconnecting.** It does not change the circuit of an already-established connection — it guarantees the *next* connection gets a fresh one. Without it, `MaxCircuitDirtiness` would reuse the same circuit, hence the same slow relays.
 
 **No continuous monitoring**: this test does not run in the background and costs nothing after connection.
+
+#### How the measurement is taken (v3.6.3)
+
+A single request measured **the cost of opening a connection**, not the circuit's capacity. Recorded on this deployment, the daemon's own measurement replayed three times in a row on a 9-hour-old circuit:
+
+```
+attempt 1 : 344 KB/s        ← opening the TCP/TLS stream through Tor
+attempt 2 : 985 KB/s
+attempt 3 : 979 KB/s
+```
+
+The first sample is 2.9x lower — on a fully mature circuit. Healthy circuits were therefore rejected, and startup stretched by minutes of pointless re-draws.
+
+The measurement now works as follows:
+
+1. **One 500 KB warm-up request, whose result is discarded.** It opens the Tor circuit's flow-control window.
+2. **Two 2 MB samples**, keeping the **maximum**.
+
+Three choices worth spelling out:
+
+- **The maximum, not the average.** The question is "can this circuit go fast enough?". One good sample proves capacity; contention only drags measurements down, so an average would penalise a sound circuit that is momentarily busy.
+- **Samples stay at 2 MB.** Counter-intuitive, but **shrinking them would skew the measurement**: each `curl` opens a fresh TCP connection, and a short transfer spends most of its life in slow-start. Measured here, after warm-up, on the same circuit:
+
+  | Sample | Measured throughput |
+  |---|---|
+  | 500 KB | 383 KB/s |
+  | 1 MB | 652 KB/s |
+  | 2 MB | 1061 KB/s |
+  | 5 MB | 1520 KB/s |
+
+  Dropping to 500 KB would divide the reading by ~2.8 and reject healthy circuits — precisely the defect being fixed. The `circuit_min_kbs` threshold is calibrated on 2 MB.
+- **A total time budget** (`_SPEED_BUDGET`, 75 s) bounds the whole thing. Without it, two salvos of slow requests would reach 165 s: the check would outlast the reconnection it is meant to decide.
+
+Network footprint: **4.5 MB per tunnel brought up** (500 KB + 2 x 2 MB), against 2 MB before. The check runs once per connection.
+
+Measured result, same tunnel: **981 and 982 KB/s in 5.3 s**, where the cold measurement gave 456 KB/s.
 
 Real-world example:
 ```
